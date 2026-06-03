@@ -226,7 +226,7 @@ pyannote 3.1 외에 NeMo Sortformer, pyannote community-1을 추가 실험했습
 
 **벡터 DB 선택 근거 (`experiments/compare_vector_dbs.py`)**
 
-200명 사용자, 일 2~3회 업데이트 패턴(600~6,000건)으로 FAISS와 Chroma를 비교했습니다.
+200명 사용자를 기준으로 FAISS와 Chroma를 비교했습니다.
 
 | 규모 | 엔진 | 인덱스 빌드 | 평균 쿼리 | P95 쿼리 |
 |---:|---|---:|---:|---:|

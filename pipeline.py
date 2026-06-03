@@ -36,12 +36,17 @@ def run_pipeline(
     transcript_output: str | Path = DEFAULT_TRANSCRIPT_OUTPUT,
     db_backend: str = "sqlite",
     pg_dsn: str | None = None,
+    num_speakers: int | None = None,
+    title: str | None = None,
 ) -> None:
     client = build_db_client(db_backend=db_backend, db_path=db_path, pg_dsn=pg_dsn)
     client.init_schema()
 
     if input_mode == "audio":
-        transcript = _build_transcript_from_audio(input_path, transcript_output, client)
+        transcript = _build_transcript_from_audio(
+            input_path, transcript_output, client,
+            num_speakers=num_speakers, title=title,
+        )
     elif input_mode == "transcript":
         transcript = load_transcript_json(input_path)
     else:
@@ -70,8 +75,10 @@ def _build_transcript_from_audio(
     input_path: str | Path,
     transcript_output: str | Path,
     client: SQLiteClient,
+    num_speakers: int | None = None,
+    title: str | None = None,
 ) -> Transcript:
-    audio_metadata = load_audio_metadata(input_path)
+    audio_metadata = load_audio_metadata(input_path, title=title)
     stt = FasterWhisperSTT()
     stt_result = stt.transcribe(audio_metadata.audio_path)
 
@@ -81,7 +88,7 @@ def _build_transcript_from_audio(
         diarization_end = audio_metadata.duration_sec or 0.0
 
     try:
-        diarization_result = PyannoteDiarizer().diarize(audio_metadata.audio_path)
+        diarization_result = PyannoteDiarizer(num_speakers=num_speakers).diarize(audio_metadata.audio_path)
         diarization_status = "completed"
         diarization_error = None
     except Exception as exc:
@@ -304,6 +311,17 @@ def main() -> None:
         default=str(DEFAULT_TRANSCRIPT_OUTPUT),
         help="Path for generated transcript JSON when input-mode=audio",
     )
+    parser.add_argument(
+        "--num-speakers",
+        type=int,
+        default=None,
+        help="Number of speakers in the meeting (hint for diarization). Omit to use automatic detection.",
+    )
+    parser.add_argument(
+        "--title",
+        default=None,
+        help="Meeting title. Defaults to the audio filename stem.",
+    )
     args = parser.parse_args()
 
     run_pipeline(
@@ -313,6 +331,8 @@ def main() -> None:
         transcript_output=args.transcript_output,
         db_backend=args.db_backend,
         pg_dsn=args.pg_dsn,
+        num_speakers=args.num_speakers,
+        title=args.title,
     )
     print(
         json.dumps(

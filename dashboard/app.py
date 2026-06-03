@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -156,18 +159,23 @@ def main() -> None:
     )
     meeting_df = as_dataframe(meetings)
 
+    tabs = st.tabs(
+        ["전체 현황", "액션 운영", "품질 점검", "STT 검토", "유사도 검색", "회의 업로드"]
+    )
+
+    with tabs[5]:
+        render_upload(db_backend, db_path, database_url)
+
     if meeting_df.empty:
-        st.warning("회의 데이터가 없습니다.")
+        for tab in tabs[:5]:
+            with tab:
+                st.info("회의 데이터가 없습니다. '회의 업로드' 탭에서 파일을 업로드해 주세요.")
         return
 
     meeting_id = st.sidebar.selectbox(
         "회의 선택",
         meeting_df["meeting_id"].tolist(),
         format_func=lambda value: _meeting_label(meeting_df, value),
-    )
-
-    tabs = st.tabs(
-        ["전체 현황", "액션 운영", "품질 점검", "STT 검토", "유사도 검색"]
     )
 
     with tabs[0]:
@@ -990,6 +998,185 @@ def _action_label(action_df: pd.DataFrame, action_item_id: str) -> str:
     row = action_df[action_df["action_item_id"] == action_item_id].iloc[0]
     prefix = f"액션 아이템 {row['action_no']} " if "action_no" in row else ""
     return f"{prefix}{row['assignee_normalized']} - {row['description']}"
+
+
+def render_upload(db_backend: str, db_path: str, database_url: str) -> None:
+    st.subheader("회의 파일 업로드")
+
+    uploaded_file = st.file_uploader(
+        "파일 선택",
+        type=["mp3", "wav", "m4a", "flac", "mp4"],
+        help="MP4는 Zoom·Teams 화면 녹화 등 영상 파일도 가능합니다. 오디오 트랙을 자동 추출합니다.",
+    )
+
+    title = st.text_input(
+        "회의 제목",
+        placeholder="예: 노바드림 5월 캠페인 킥오프",
+        help="대시보드와 DB에 저장될 회의 이름입니다.",
+    )
+    num_speakers = st.number_input(
+        "참여 인원 (명)",
+        min_value=1,
+        max_value=20,
+        value=2,
+        step=1,
+        help="화자분리 정확도를 높이기 위한 힌트입니다. 모르면 2명으로 설정하세요.",
+    )
+
+    run_disabled = uploaded_file is None or not title.strip()
+    if st.button("처리 시작", disabled=run_disabled, type="primary"):
+        _run_upload_pipeline(
+            uploaded_file=uploaded_file,
+            title=title.strip(),
+            num_speakers=int(num_speakers),
+            db_backend=db_backend,
+            db_path=db_path,
+            database_url=database_url,
+        )
+
+
+def _run_upload_pipeline(
+    uploaded_file: object,
+    title: str,
+    num_speakers: int,
+    db_backend: str,
+    db_path: str,
+    database_url: str,
+) -> None:
+    from analytics.embeddings import generate_and_store_embeddings
+    from ingestion.audio_loader import load_audio_metadata
+    from ingestion.diarization import PyannoteDiarizer, fallback_single_speaker
+    from ingestion.stt import FasterWhisperSTT
+    from ingestion.transcript_builder import build_transcript, save_transcript_json
+    from models import stable_hash, utc_now_iso
+    from pipeline import _extract_and_store, _store_chunks, _store_transcript, build_db_client
+    from preprocessing.chunker import build_chunks
+    from preprocessing.normalizer import normalize_speakers, remove_consecutive_duplicates
+
+    # ── 파일 저장 ────────────────────────────────────────────────────
+    upload_dir = Path("data/raw")
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = re.sub(r"[^\w가-힣\-]", "_", title)[:60]
+    suffix = Path(uploaded_file.name).suffix.lower()
+    save_path = upload_dir / f"{safe_name}{suffix}"
+    save_path.write_bytes(uploaded_file.getbuffer())
+
+    audio_path = save_path
+    if suffix == ".mp4":
+        with st.spinner("MP4에서 오디오 추출 중 ..."):
+            wav_path = save_path.with_suffix(".wav")
+            ok, err = _convert_mp4_to_wav(save_path, wav_path)
+        if not ok:
+            st.error(
+                f"MP4 오디오 추출 실패: {err}\n\n"
+                "ffmpeg가 설치되어 있지 않으면 MP3 파일로 변환 후 다시 업로드해 주세요."
+            )
+            return
+        audio_path = wav_path
+
+    transcript_output = Path(f"data/processed/transcript_{safe_name}.json")
+    pg_dsn = database_url if db_backend == "postgres" else None
+
+    try:
+        client = build_db_client(db_backend=db_backend, db_path=db_path, pg_dsn=pg_dsn)
+        client.init_schema()
+        audio_metadata = load_audio_metadata(audio_path, title=title)
+
+        # ── 1단계: STT ───────────────────────────────────────────────
+        with st.spinner("음성 인식(STT) 중 ..."):
+            stt_result = FasterWhisperSTT().transcribe(audio_metadata.audio_path)
+        st.success(f"음성 인식 완료 — 발화 {len(stt_result.segments)}개")
+
+        # ── 2단계: 화자 분리 ─────────────────────────────────────────
+        with st.spinner(f"화자 분리 중 ({num_speakers}명 힌트) ..."):
+            diarization_end = max(
+                (s.end_sec for s in stt_result.segments),
+                default=audio_metadata.duration_sec or 0.0,
+            )
+            try:
+                diarization_result = PyannoteDiarizer(num_speakers=num_speakers).diarize(
+                    audio_metadata.audio_path
+                )
+                diarization_status = "completed"
+                diarization_error = None
+            except Exception as exc:
+                diarization_result = fallback_single_speaker(0.0, diarization_end)
+                diarization_status = "fallback"
+                diarization_error = str(exc)
+        st.success(f"화자 분리 완료 — {diarization_result.speaker_count}명 감지")
+
+        # ── 3단계: 트랜스크립트 구성 + DB 저장 ──────────────────────
+        with st.spinner("트랜스크립트 구성 및 저장 중 ..."):
+            transcript = build_transcript(audio_metadata, stt_result, diarization_result)
+            saved_path = save_transcript_json(transcript, transcript_output)
+            transcript.meeting.transcript_path = str(saved_path)
+
+            _store_transcript(client, transcript)
+            client.upsert(
+                "stt_runs",
+                {
+                    "stt_run_id": stable_hash("stt", transcript.meeting.meeting_id),
+                    "meeting_id": transcript.meeting.meeting_id,
+                    "audio_path": str(audio_metadata.audio_path),
+                    "audio_hash": audio_metadata.audio_hash,
+                    "stt_model": stt_result.model_name,
+                    "diarization_model": diarization_result.model_name,
+                    "language": stt_result.language or "ko",
+                    "duration_sec": audio_metadata.duration_sec,
+                    "segment_count": len(stt_result.segments),
+                    "speaker_count": diarization_result.speaker_count,
+                    "status": diarization_status,
+                    "error_message": diarization_error,
+                },
+                conflict_columns=["stt_run_id"],
+                update_columns=[
+                    "audio_path", "audio_hash", "stt_model", "diarization_model",
+                    "language", "duration_sec", "segment_count", "speaker_count",
+                    "status", "error_message",
+                ],
+            )
+
+            transcript = remove_consecutive_duplicates(normalize_speakers(transcript))
+            chunks = build_chunks(transcript)
+            _store_chunks(client, chunks)
+
+        # ── 4단계: 액션 추출 ─────────────────────────────────────────
+        with st.spinner("액션 추출 중 (LLM) ..."):
+            _extract_and_store(client, transcript.meeting.meeting_id, chunks)
+        st.success("액션 추출 완료")
+
+        # ── 5단계: 임베딩 ────────────────────────────────────────────
+        with st.spinner("유사도 검색용 임베딩 생성 중 ..."):
+            generate_and_store_embeddings(client, transcript.meeting.meeting_id)
+
+        st.balloons()
+        st.success(f"'{title}' 회의 처리가 모두 완료됐습니다. 사이드바에서 회의를 선택하세요.")
+        get_client.clear()
+        st.rerun()
+
+    except Exception as exc:
+        st.error(f"처리 중 오류 발생: {exc}")
+
+
+def _convert_mp4_to_wav(mp4_path: Path, wav_path: Path) -> tuple[bool, str | None]:
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", str(mp4_path),
+                "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+                str(wav_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if result.returncode == 0:
+            return True, None
+        return False, (result.stderr or "ffmpeg 오류")[-300:]
+    except FileNotFoundError:
+        return False, "ffmpeg를 찾을 수 없음"
+    except Exception as exc:
+        return False, str(exc)
 
 
 if __name__ == "__main__":

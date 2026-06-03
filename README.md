@@ -191,13 +191,51 @@ $env:VECTOR_DB_PATH="data/vector/faiss_action_items"
 
 | 구성요소 | 선택 | 대안 | 선택 이유 |
 |---|---|---|---|
-| **STT** | faster-whisper (local, large-v3) | Whisper API, Clova | 무료·오프라인 동작. large-v3 한국어 성능이 제공 transcript와 가장 근접. base 대비 WER 개선 확인 |
-| **화자분리** | pyannote/speaker-diarization-3.1 | NeMo, resemblyzer | HuggingFace 허브 직접 사용, 설치 단순. 실시간 불필요하므로 오프라인 배치 처리로 충분 |
+| **STT** | faster-whisper (local, large-v3) | Whisper API, Clova | 무료·오프라인 동작. 4종 모델 비교 실험에서 large-v3가 발화 수(42개)가 레퍼런스(37개)에 가장 근접하고 키워드 재현율 1.000 달성 |
+| **화자분리** | pyannote/speaker-diarization-3.1 | NeMo Sortformer, pyannote community-1 | 3종 비교 결과 모두 2화자 감지 (레퍼런스 3명). 화자 수 불일치는 오디오 특성 문제이며, pyannote 3.1이 설치 단순·처리 속도 우위 |
 | **LLM 추출** | Gemini 2.5 Flash Lite | GPT-4o, Claude | 무료 티어 내 한국어 구조화 출력 품질 확보. API 오류 시 mock fallback으로 파이프라인 중단 없음 |
 | **DB** | SQLite (기본) / PostgreSQL (운영) | DuckDB, MySQL | SQLite는 설치 없이 로컬 재현 가능. DB 벤치마크(`experiments/db_benchmark.py`) 수행 결과 집계 쿼리 성능 충분. 다중 접속 확장 시 PostgreSQL 전환 |
 | **대시보드** | Streamlit | React, Metabase | Python 단일 스택, 마케터 직접 운영 대상. 빠른 프로토타이핑 가능 |
-| **벡터 DB** | FAISS (로컬) | ChromaDB, Pinecone | API 키 없이 로컬 동작. 384차원 IndexFlatIP로 소규모 액션아이템 검색에 충분. 비교 실험(`experiments/compare_vector_dbs.py`) 포함 |
+| **벡터 DB** | FAISS (로컬) | ChromaDB, Pinecone | 600건 기준 평균 쿼리 0.060ms (Chroma 6.653ms 대비 약 111배 빠름). PostgreSQL이 메타데이터를 담당하므로 Chroma의 문서 관리 기능이 불필요 |
 | **임베딩** | sentence-transformers (local) | Gemini text-embedding | API 키 없이 의미 검색 동작. 한국어 지원 모델 직접 선택 가능 |
+
+**STT 모델 선택 근거 (`experiments/compare_stt_diarization.py`)**
+
+동일 오디오(4분, 3화자)에 4종 STT 모델을 실행해 레퍼런스 transcript(37발화)와 비교했습니다.
+
+| 모델 | 발화 수 | 키워드 재현율 | 처리 시간 |
+|---|---:|---:|---:|
+| `base` | 79 | 1.000 | 196초 |
+| `small` | 62 | 0.857 (`A/B` 누락) | 231초 |
+| `medium` | 129 | 1.000 | 507초 |
+| **`large-v3`** | **42** | **1.000** | 823초 |
+
+`large-v3`는 발화 수가 레퍼런스(37)에 가장 근접하고 도메인 키워드를 모두 포착했습니다. 처리 시간이 길지만 배치 처리이므로 허용 가능하다고 판단했습니다. 자세한 내용은 `docs/stt_diarization_model_comparison.md`를 참고하세요.
+
+**화자분리 모델 선택 근거**
+
+pyannote 3.1 외에 NeMo Sortformer, pyannote community-1을 추가 실험했습니다.
+
+| 조합 | 화자분리 소요 | 감지 화자 수 |
+|---|---:|---:|
+| large-v3 + pyannote 3.1 (채택) | — | 2 |
+| large-v3 + NeMo Sortformer | 37.9초 | 2 |
+| large-v3 + pyannote community-1 | 130.4초 | 2 |
+
+세 모델 모두 2화자를 감지했습니다. 이는 STT 모델 문제가 아니라 유사한 목소리 특성을 가진 두 화자를 화자분리 알고리즘이 하나로 묶는 오디오 특성 문제입니다. pyannote 3.1은 HuggingFace 허브에서 직접 로드 가능하고 NeMo 대비 의존성이 단순해 선택했습니다. 화자 불일치는 숨기지 않고 STT 검토 탭에 노출했습니다.
+
+**벡터 DB 선택 근거 (`experiments/compare_vector_dbs.py`)**
+
+200명 사용자, 일 2~3회 업데이트 패턴(600~6,000건)으로 FAISS와 Chroma를 비교했습니다.
+
+| 규모 | 엔진 | 인덱스 빌드 | 평균 쿼리 | P95 쿼리 |
+|---:|---|---:|---:|---:|
+| 600건 | **FAISS** | 0.357ms | **0.060ms** | 0.115ms |
+| 600건 | Chroma | 898ms | 6.653ms | 22.810ms |
+| 6,000건 | **FAISS** | 3.267ms | **0.621ms** | 0.718ms |
+| 6,000건 | Chroma | 5,236ms | 2.499ms | 6.310ms |
+
+FAISS가 빌드·쿼리 모두 압도적으로 빠릅니다. PostgreSQL이 이미 메타데이터를 관리하므로 Chroma의 문서 컬렉션 기능이 불필요하다는 점도 FAISS 선택의 근거입니다. 자세한 내용은 `docs/vector_db_comparison.md`를 참고하세요.
 
 **DB 선택 근거 (벤치마크 요약)**
 

@@ -234,3 +234,15 @@ CREATE TABLE IF NOT EXISTS action_item_embeddings (
 
 CREATE INDEX IF NOT EXISTS idx_embeddings_model
     ON action_item_embeddings(model_name);
+
+CREATE TABLE IF NOT EXISTS meeting_summaries (
+    summary_id   TEXT PRIMARY KEY,
+    meeting_id   TEXT NOT NULL UNIQUE,
+    agenda_json  TEXT NOT NULL DEFAULT '[]',
+    decisions_json TEXT NOT NULL DEFAULT '[]',
+    summary_text TEXT NOT NULL DEFAULT '',
+    provider     TEXT NOT NULL DEFAULT 'mock',
+    model_name   TEXT,
+    created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (meeting_id) REFERENCES meetings(meeting_id) ON DELETE CASCADE
+);

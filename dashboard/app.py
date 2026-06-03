@@ -191,6 +191,9 @@ def main() -> None:
 
 
 def render_overview(client: object, meeting_id: str) -> None:
+    _render_meeting_summary(client, meeting_id)
+    st.divider()
+
     actions = client.list_action_items(meeting_id)
     summary = confidence_summary(client, meeting_id)
 
@@ -1000,6 +1003,52 @@ def _action_label(action_df: pd.DataFrame, action_item_id: str) -> str:
     return f"{prefix}{row['assignee_normalized']} - {row['description']}"
 
 
+def _render_meeting_summary(client: object, meeting_id: str) -> None:
+    row = client.fetch_one(
+        "SELECT agenda_json, decisions_json, summary_text, provider FROM meeting_summaries WHERE meeting_id = ?",
+        (meeting_id,),
+    )
+
+    st.subheader("회의록 요약")
+
+    if not row:
+        st.info("회의록 요약이 없습니다. 파이프라인을 재실행하면 자동으로 생성됩니다.")
+        if st.button("요약 생성"):
+            from extraction.summarizer import summarize_and_store
+            from ingestion.transcript_builder import load_transcript_json
+            meeting = client.fetch_one("SELECT transcript_path FROM meetings WHERE meeting_id = ?", (meeting_id,))
+            if meeting and meeting.get("transcript_path"):
+                transcript = load_transcript_json(meeting["transcript_path"])
+                summarize_and_store(client, meeting_id, transcript)
+                st.rerun()
+            else:
+                st.warning("저장된 트랜스크립트 파일을 찾을 수 없습니다.")
+        return
+
+    agenda = json.loads(row["agenda_json"] or "[]")
+    decisions = json.loads(row["decisions_json"] or "[]")
+    summary_text = row.get("summary_text") or ""
+
+    col_agenda, col_decisions = st.columns(2)
+
+    with col_agenda:
+        st.markdown("**논의 안건**")
+        for item in agenda:
+            st.markdown(f"- {item}")
+
+    with col_decisions:
+        st.markdown("**주요 결정 사항**")
+        for item in decisions:
+            st.markdown(f"- {item}")
+
+    if summary_text:
+        st.markdown("**전체 요약**")
+        st.write(summary_text)
+
+    provider = row.get("provider", "mock")
+    st.caption(f"생성 방식: {'Gemini AI' if provider == 'gemini' else 'Mock (Gemini API 키 설정 시 AI 요약 가능)'}")
+
+
 def render_upload(db_backend: str, db_path: str, database_url: str) -> None:
     st.subheader("회의 파일 업로드")
 
@@ -1145,7 +1194,13 @@ def _run_upload_pipeline(
             _extract_and_store(client, transcript.meeting.meeting_id, chunks)
         st.success("액션 추출 완료")
 
-        # ── 5단계: 임베딩 ────────────────────────────────────────────
+        # ── 5단계: 회의록 요약 ───────────────────────────────────────
+        with st.spinner("회의록 요약 생성 중 ..."):
+            from extraction.summarizer import summarize_and_store
+            summarize_and_store(client, transcript.meeting.meeting_id, transcript)
+        st.success("회의록 요약 완료")
+
+        # ── 6단계: 임베딩 ────────────────────────────────────────────
         with st.spinner("유사도 검색용 임베딩 생성 중 ..."):
             generate_and_store_embeddings(client, transcript.meeting.meeting_id)
 

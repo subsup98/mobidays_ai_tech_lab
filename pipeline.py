@@ -8,6 +8,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from analytics.embeddings import generate_and_store_embeddings
+from extraction.summarizer import summarize_and_store
 from db.pg_client import DEFAULT_DSN, PostgreSQLClient
 from db.sqlite_client import DEFAULT_DB_PATH, SQLiteClient
 from extraction.extractor import build_extractor
@@ -58,6 +59,7 @@ def run_pipeline(
     _store_transcript(client, transcript)
     _store_chunks(client, chunks)
     _extract_and_store(client, transcript.meeting.meeting_id, chunks)
+    summarize_and_store(client, transcript.meeting.meeting_id, transcript)
     generate_and_store_embeddings(client, transcript.meeting.meeting_id)
 
 

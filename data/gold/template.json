@@ -1,0 +1,26 @@
+{
+  "meeting_id": "REPLACE_WITH_MEETING_ID",
+  "gold_action_items": [
+    {
+      "description": "ROAS 리포트를 정리한다",
+      "assignee_normalized": "team_lead",
+      "category": "reporting",
+      "due_date": null,
+      "priority": "high"
+    },
+    {
+      "description": "CPM 이슈 원인을 확인한다",
+      "assignee_normalized": "performance_marketer",
+      "category": "performance",
+      "due_date": "2024-12-20",
+      "priority": "high"
+    },
+    {
+      "description": "CTA 문구 A/B 테스트를 진행한다",
+      "assignee_normalized": "content_designer",
+      "category": "creative",
+      "due_date": null,
+      "priority": "medium"
+    }
+  ]
+}

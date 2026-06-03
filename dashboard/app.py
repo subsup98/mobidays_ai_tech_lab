@@ -1,0 +1,996 @@
+from __future__ import annotations
+
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+import altair as alt
+import pandas as pd
+import streamlit as st
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from analytics.embeddings import (
+    search_similar,
+    vector_db_path,
+    vector_record_count,
+)
+from analytics.evaluation import full_evaluation_report
+from analytics.keywords import regenerate_issue_keywords
+from analytics.quality import (
+    confidence_summary,
+    low_confidence_items,
+    validation_mismatches,
+)
+from db.pg_client import DEFAULT_DSN, PostgreSQLClient
+from db.sqlite_client import SQLiteClient
+from integrations.slack_mock import generate_and_store_payloads
+from models import stable_hash
+
+
+DEFAULT_DB_BACKEND = os.getenv("DB_BACKEND", "sqlite")
+DEFAULT_DB = os.getenv("DATABASE_PATH", "data/app.db")
+DEFAULT_DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("PGDSN") or DEFAULT_DSN
+
+
+st.set_page_config(page_title="모비데이즈 회의 액션 대시보드", layout="wide")
+
+
+COLUMN_LABELS = {
+    "action_item_id": "액션 ID",
+    "action_no": "액션 아이템",
+    "assignee": "담당자",
+    "assignee_normalized": "담당 역할",
+    "category": "분류",
+    "priority": "우선순위",
+    "status": "상태",
+    "review_required": "검토 필요",
+    "final_confidence": "최종 신뢰도",
+    "llm_confidence": "LLM 신뢰도",
+    "validation_score": "검증 점수",
+    "description": "작업 내용",
+    "display_description": "후속 작업",
+    "due_date": "기한",
+    "keyword": "키워드",
+    "keyword_type": "키워드 유형",
+    "score": "점수",
+    "frequency": "빈도",
+    "source_action_count": "관련 액션 수",
+    "sequence_no": "순번",
+    "speaker_raw": "원본 화자",
+    "speaker_normalized": "정규화 화자",
+    "start_sec": "시작초",
+    "end_sec": "종료초",
+    "text": "발화 내용",
+    "old_status": "이전 상태",
+    "new_status": "변경 상태",
+    "changed_by": "변경자",
+    "note": "메모",
+    "created_at": "생성 시각",
+    "model_name": "모델명",
+    "provider": "제공자",
+    "mode": "모드",
+    "parsed_ok": "파싱 성공",
+    "retry_count": "재시도",
+    "error_message": "오류",
+    "stt_model": "STT 모델",
+    "diarization_model": "화자분리 모델",
+    "speaker_count": "화자 수",
+    "segment_count": "발화 수",
+    "duration_sec": "길이초",
+    "meeting_title": "회의명",
+    "campaign": "캠페인",
+    "advertiser": "광고주",
+    "action_count": "전체 액션",
+    "open_count": "미완료 액션",
+    "similarity": "유사도",
+    "open_count": "미완료 수",
+    "evidence_summary": "근거 발화 요약",
+    "priority_reason": "우선순위 근거",
+    "review_reason": "검토 필요 사유",
+    "risk_flag": "위험 신호",
+    "count": "건수",
+}
+
+
+RISK_FLAG_LABELS = {
+    "assignee_missing": "담당자 불명확",
+    "due_date_missing": "기한 없음",
+    "source_missing": "근거 발화 없음",
+    "category_unclear": "분류 불명확",
+    "description_too_short": "설명 부족",
+}
+
+
+@st.cache_resource
+def get_client(db_backend: str, db_path: str, database_url: str) -> object:
+    if db_backend == "postgres":
+        client = PostgreSQLClient(dsn=database_url)
+    else:
+        client = SQLiteClient(db_path)
+    client.init_schema()
+    return client
+
+
+def as_dataframe(rows: list[dict[str, object]]) -> pd.DataFrame:
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
+def display_dataframe(df: pd.DataFrame, **kwargs: object) -> None:
+    if df.empty:
+        st.dataframe(df, width="stretch", hide_index=True, **kwargs)
+        return
+    st.dataframe(
+        df.rename(columns={k: v for k, v in COLUMN_LABELS.items() if k in df.columns}),
+        width="stretch",
+        hide_index=True,
+        **kwargs,
+    )
+
+
+def main() -> None:
+    st.title("모비데이즈 회의 액션 대시보드")
+    db_backend = st.sidebar.selectbox(
+        "운영 DB",
+        ["postgres", "sqlite"],
+        index=0 if DEFAULT_DB_BACKEND == "postgres" else 1,
+    )
+    db_path = st.sidebar.text_input("SQLite DB 경로", DEFAULT_DB)
+    database_url = st.sidebar.text_input("PostgreSQL DSN", DEFAULT_DATABASE_URL)
+    st.sidebar.caption(f"Vector DB: {vector_db_path()}")
+    client = get_client(db_backend, db_path, database_url)
+
+    meetings = client.fetch_all(
+        """
+        SELECT meeting_id, title, meeting_date, source_type, created_at
+        FROM meetings
+        ORDER BY created_at DESC
+        """
+    )
+    meeting_df = as_dataframe(meetings)
+
+    if meeting_df.empty:
+        st.warning("회의 데이터가 없습니다.")
+        return
+
+    meeting_id = st.sidebar.selectbox(
+        "회의 선택",
+        meeting_df["meeting_id"].tolist(),
+        format_func=lambda value: _meeting_label(meeting_df, value),
+    )
+
+    tabs = st.tabs(
+        ["전체 현황", "액션 운영", "품질 점검", "STT 검토", "유사도 검색"]
+    )
+
+    with tabs[0]:
+        render_overview(client, meeting_id)
+    with tabs[1]:
+        render_action_ops(client, meeting_id)
+    with tabs[2]:
+        render_quality(client, meeting_id)
+    with tabs[3]:
+        render_stt_review(client, meeting_id)
+    with tabs[4]:
+        render_similar_decisions(client, meeting_id)
+
+
+def render_overview(client: object, meeting_id: str) -> None:
+    actions = client.list_action_items(meeting_id)
+    summary = confidence_summary(client, meeting_id)
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("액션 수", int(summary["total"]))
+    col2.metric("검토 필요", int(summary["review_required_count"]))
+    col3.metric("최종 신뢰도", summary["avg_final_confidence"])
+    col4.metric("검증 점수", summary["avg_validation_score"])
+
+    # ── 위젯 1: 회의별 액션아이템 발생 추이 ──────────────────────────
+    st.subheader("회의별 액션아이템 발생 추이")
+    trend_rows = client.fetch_all(
+        """
+        SELECT
+            m.title,
+            COALESCE(m.meeting_date, CAST(m.created_at AS VARCHAR)) AS meeting_date,
+            COUNT(a.action_item_id) AS action_count,
+            SUM(CASE WHEN a.status != 'done' THEN 1 ELSE 0 END) AS open_count
+        FROM meetings m
+        LEFT JOIN action_items a ON a.meeting_id = m.meeting_id
+        GROUP BY m.meeting_id, m.title, meeting_date
+        ORDER BY meeting_date ASC
+        """
+    )
+    trend_df = as_dataframe(trend_rows)
+    if trend_df.empty:
+        st.info("회의 데이터가 없습니다.")
+    else:
+        trend_df["meeting_date"] = trend_df["meeting_date"].astype(str).str[:10]
+        trend_melt = trend_df.melt(
+            id_vars=["title", "meeting_date"],
+            value_vars=["action_count", "open_count"],
+            var_name="구분",
+            value_name="건수",
+        )
+        trend_melt["구분"] = trend_melt["구분"].map(
+            {"action_count": "전체 액션", "open_count": "미완료 액션"}
+        )
+        x_labels = (trend_df["meeting_date"] + "\n" + trend_df["title"]).tolist()
+        st.altair_chart(
+            alt.Chart(trend_melt).mark_bar().encode(
+                x=alt.X(
+                    "meeting_date:N",
+                    title="회의 날짜",
+                    axis=alt.Axis(labelAngle=-30),
+                ),
+                y=alt.Y("건수:Q", title="건수", scale=alt.Scale(domainMin=0)),
+                color=alt.Color(
+                    "구분:N",
+                    scale=alt.Scale(
+                        domain=["전체 액션", "미완료 액션"],
+                        range=["#4C8BF5", "#E8433A"],
+                    ),
+                ),
+                xOffset="구분:N",
+                tooltip=["title", "meeting_date", "구분", "건수"],
+            ).properties(width="container", height=260),
+            width="stretch",
+        )
+
+    # ── 이 회의 상태별 현황 ──────────────────────────────────────────
+    action_df = as_dataframe(actions)
+    if not action_df.empty:
+        st.subheader("이 회의 상태별 현황")
+        _status_ko = {
+            "open": "미시작",
+            "in_progress": "진행 중",
+            "blocked": "블로킹",
+            "done": "완료",
+        }
+        status_order = ["open", "in_progress", "blocked", "done"]
+        status_order_ko = [_status_ko[s] for s in status_order]
+        status_counts = action_df.groupby("status").size().reset_index(name="건수")
+        status_counts["상태명"] = status_counts["status"].map(_status_ko)
+        st.altair_chart(
+            alt.Chart(status_counts).mark_bar().encode(
+                x=alt.X("상태명:N", title="상태", sort=status_order_ko),
+                y=alt.Y("건수:Q", title="건수", scale=alt.Scale(domainMin=0), axis=alt.Axis(tickMinStep=1, format="d")),
+                color=alt.Color(
+                    "상태명:N",
+                    sort=status_order_ko,
+                    scale=alt.Scale(
+                        domain=status_order_ko,
+                        range=["#4C8BF5", "#F5A623", "#E8433A", "#34A853"],
+                    ),
+                    legend=alt.Legend(title="상태"),
+                ),
+                tooltip=["상태명:N", "건수:Q"],
+            ).properties(width="container", height=220),
+            width="stretch",
+        )
+
+        # ── 위젯 2: 담당자별 미완료 Top N ───────────────────────────
+        st.subheader("담당자별 미완료 액션 Top N")
+        assignee_backlog = (
+            action_df[action_df["status"] != "done"]
+            .groupby("assignee_normalized")
+            .size()
+            .reset_index(name="open_count")
+            .sort_values("open_count", ascending=False)
+        )
+        if assignee_backlog.empty:
+            st.success("미완료 액션이 없습니다.")
+        else:
+            st.altair_chart(
+                alt.Chart(assignee_backlog).mark_bar().encode(
+                    x=alt.X("open_count:Q", title="미완료 건수", scale=alt.Scale(domainMin=0), axis=alt.Axis(tickMinStep=1, format="d")),
+                    y=alt.Y("assignee_normalized:N", title="담당자", sort="-x"),
+                    color=alt.value("#F5A623"),
+                    tooltip=["assignee_normalized", "open_count"],
+                ).properties(width="container", height=max(120, len(assignee_backlog) * 40)),
+                width="stretch",
+            )
+
+    # ── 위젯 3: 캠페인/광고주별 반복 이슈 키워드 ────────────────────
+    st.subheader("캠페인/광고주별 이슈 키워드")
+    if st.button("이슈 키워드 재생성"):
+        regenerate_issue_keywords(client, meeting_id)
+        st.rerun()
+
+    campaign_rows = client.fetch_all(
+        """
+        SELECT DISTINCT
+            COALESCE(campaign_context, '(미분류)') AS campaign,
+            COALESCE(advertiser_context, '(미분류)') AS advertiser
+        FROM action_items
+        WHERE meeting_id = ?
+        ORDER BY campaign
+        """,
+        (meeting_id,),
+    )
+    campaigns = ["전체"] + sorted({r["campaign"] for r in campaign_rows if r["campaign"] != "(미분류)"})
+    advertisers = ["전체"] + sorted({r["advertiser"] for r in campaign_rows if r["advertiser"] != "(미분류)"})
+
+    filter_col1, filter_col2 = st.columns(2)
+    sel_campaign = filter_col1.selectbox("캠페인 필터", campaigns, key="kw_campaign")
+    sel_advertiser = filter_col2.selectbox("광고주 필터", advertisers, key="kw_advertiser")
+
+    kw_rows = client.fetch_all(
+        """
+        SELECT
+            ik.keyword,
+            ik.keyword_type,
+            ik.score,
+            ik.frequency,
+            ik.source_action_count,
+            COALESCE(a.campaign_context, '(미분류)') AS campaign,
+            COALESCE(a.advertiser_context, '(미분류)') AS advertiser
+        FROM issue_keywords ik
+        LEFT JOIN action_items a ON a.meeting_id = ik.meeting_id
+        WHERE ik.meeting_id = ?
+        GROUP BY ik.keyword, ik.keyword_type, ik.score, ik.frequency,
+                 ik.source_action_count, campaign, advertiser
+        ORDER BY ik.score DESC
+        """,
+        (meeting_id,),
+    )
+    kw_df = as_dataframe(kw_rows)
+    if not kw_df.empty:
+        if sel_campaign != "전체":
+            kw_df = kw_df[kw_df["campaign"] == sel_campaign]
+        if sel_advertiser != "전체":
+            kw_df = kw_df[kw_df["advertiser"] == sel_advertiser]
+        kw_df = kw_df.drop_duplicates(subset=["keyword", "keyword_type"]).head(20)
+        display_dataframe(kw_df[["keyword", "keyword_type", "score", "frequency", "source_action_count", "campaign", "advertiser"]])
+    else:
+        st.info("키워드가 없습니다. 이슈 키워드 재생성 버튼을 눌러주세요.")
+
+
+def render_action_ops(client: object, meeting_id: str) -> None:
+    actions = client.list_action_items(meeting_id)
+    action_df = _sort_actions(as_dataframe(actions))
+    action_df = _with_action_numbers(action_df)
+    action_df = _add_display_descriptions(client, meeting_id, action_df)
+    st.subheader("액션 요약")
+    summary_df = build_action_summary_df(client, meeting_id)
+    display_dataframe(summary_df)
+
+    st.subheader("액션 상세")
+    visible_columns = [
+        "action_no",
+        "assignee_normalized",
+        "category",
+        "priority",
+        "status",
+        "review_required",
+        "final_confidence",
+        "display_description",
+        "due_date",
+    ]
+    display_dataframe(
+        action_df[[col for col in visible_columns if col in action_df.columns]],
+    )
+
+    if action_df.empty:
+        return
+
+    selected = st.selectbox(
+        "액션 선택",
+        action_df["action_item_id"].tolist(),
+        format_func=lambda value: _action_label(action_df, value),
+    )
+    selected_row = action_df[action_df["action_item_id"] == selected].iloc[0]
+
+    detail_left, detail_right = st.columns([2, 3])
+    with detail_left:
+        st.markdown("**선택한 액션**")
+        st.write(f"액션 아이템: {selected_row['action_no']}")
+        st.write(f"담당 역할: {selected_row['assignee_normalized']}")
+        st.write(f"분류: {selected_row['category']}")
+        st.write(f"우선순위: {selected_row['priority']}")
+        st.write(f"우선순위 근거: {_priority_reason(selected_row)}")
+        st.write(f"상태: {selected_row['status']}")
+        st.write(f"신뢰도: {selected_row['final_confidence']}")
+        st.write(f"검토 필요: {bool(selected_row['review_required'])}")
+        st.write(f"후속 작업: {selected_row['display_description']}")
+        if selected_row["display_description"] != selected_row["description"]:
+            st.caption(f"원본 추출 문구: {selected_row['description']}")
+
+    with detail_right:
+        st.markdown("**근거 발화**")
+        evidence = client.fetch_all(
+            """
+            SELECT
+                u.sequence_no,
+                u.speaker_raw,
+                u.speaker_normalized,
+                u.start_sec,
+                u.end_sec,
+                u.text
+            FROM action_item_sources s
+            JOIN utterances u ON u.utterance_id = s.utterance_id
+            WHERE s.action_item_id = ?
+            ORDER BY u.sequence_no
+            """,
+            (selected,),
+        )
+        display_dataframe(as_dataframe(evidence))
+
+    new_status = st.selectbox("상태 변경", ["open", "in_progress", "done", "blocked"])
+    note = st.text_input("메모", "")
+
+    if st.button("상태 업데이트"):
+        event_id = stable_hash(
+            "event",
+            selected,
+            new_status,
+            datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        )
+        client.update_action_status(
+            action_item_id=selected,
+            new_status=new_status,
+            event_id=event_id,
+            note=note or None,
+        )
+        st.rerun()
+
+    if st.button("Slack payload 생성"):
+        generate_and_store_payloads(client, meeting_id)
+        st.rerun()
+
+    payloads = client.fetch_all(
+        """
+        SELECT payload_json, created_at
+        FROM slack_payloads
+        WHERE action_item_id IN (
+            SELECT action_item_id FROM action_items WHERE meeting_id = ?
+        )
+        ORDER BY created_at DESC
+        """,
+        (meeting_id,),
+    )
+    if payloads:
+        st.json(json.loads(payloads[0]["payload_json"]))
+
+    events = client.fetch_all(
+        """
+        SELECT e.action_item_id, e.old_status, e.new_status, e.changed_by, e.note, e.created_at
+        FROM action_item_events e
+        JOIN action_items a ON a.action_item_id = e.action_item_id
+        WHERE a.meeting_id = ?
+        ORDER BY e.created_at DESC
+        """,
+        (meeting_id,),
+    )
+    display_dataframe(as_dataframe(events))
+
+
+def render_quality(client: object, meeting_id: str) -> None:
+    actions = client.list_action_items(meeting_id)
+    action_df = as_dataframe(actions)
+    action_df = _add_display_descriptions(client, meeting_id, action_df)
+
+    if action_df.empty:
+        st.info("이 회의에는 품질 점검할 액션아이템이 없습니다.")
+        return
+
+    st.caption(
+        "LLM 신뢰도는 모델의 자체 판단, 검증 점수는 담당자/기한/근거 발화 같은 규칙 기반 점검입니다. "
+        "최종 신뢰도는 둘 중 낮은 값이며, 위험 신호가 있으면 검토 필요로 표시됩니다."
+    )
+
+    review_df = _build_review_reason_df(action_df)
+    flagged_df = review_df[review_df["review_required"] == 1]
+    risk_summary_df = _build_risk_flag_summary_df(review_df)
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("검토 필요", f"{len(flagged_df)} / {len(action_df)}")
+    col2.metric("주요 위험 신호", _risk_summary_metric(risk_summary_df))
+    col3.metric("최저 최종 신뢰도", round(float(action_df["final_confidence"].min()), 3))
+
+    if not risk_summary_df.empty:
+        st.subheader("검토 필요 사유 요약")
+        display_dataframe(risk_summary_df)
+    else:
+        st.success("담당자, 기한, 근거 발화 기준에서 감지된 위험 신호가 없습니다.")
+
+    if not action_df.empty:
+        st.subheader("신뢰도 분포")
+        chart_df = action_df[["llm_confidence", "validation_score", "review_required"]].copy()
+        chart_df["검토 필요"] = chart_df["review_required"].map({0: "아니오", 1: "예"}).fillna("아니오")
+        st.altair_chart(
+            alt.Chart(chart_df).mark_circle(size=80).encode(
+                x=alt.X("llm_confidence", title="LLM 신뢰도", scale=alt.Scale(domain=[0, 1])),
+                y=alt.Y("validation_score", title="검증 점수", scale=alt.Scale(domain=[0, 1])),
+                color=alt.Color("검토 필요", scale=alt.Scale(domain=["아니오", "예"], range=["#4C8BF5", "#E8433A"])),
+                tooltip=["llm_confidence", "validation_score", "검토 필요"],
+            ).properties(width="container", height=320),
+            width="stretch",
+        )
+
+    low_items = low_confidence_items(client, meeting_id)
+    mismatches = validation_mismatches(client, meeting_id)
+
+    left, right = st.columns(2)
+    left.subheader("낮은 신뢰도")
+    with left:
+        low_df = _with_action_numbers(as_dataframe(low_items))
+        if low_df.empty:
+            st.info("최종 신뢰도 0.7 미만 항목은 없습니다.")
+        else:
+            display_dataframe(_quality_table(low_df))
+    right.subheader("LLM은 높지만 검증은 낮음")
+    with right:
+        mismatch_df = _with_action_numbers(as_dataframe(mismatches))
+        if mismatch_df.empty:
+            st.info("LLM 신뢰도와 검증 점수 차이가 0.2 이상인 항목은 없습니다.")
+        else:
+            display_dataframe(_quality_table(mismatch_df))
+
+    st.subheader("검토 필요 항목")
+    if flagged_df.empty:
+        st.info("사람이 확인해야 하는 항목이 없습니다.")
+    else:
+        display_dataframe(
+            flagged_df[
+                [
+                    "action_no",
+                    "assignee_normalized",
+                    "display_description",
+                    "llm_confidence",
+                    "validation_score",
+                    "final_confidence",
+                    "review_reason",
+                ]
+            ]
+        )
+
+    st.divider()
+    st.subheader("평가 지표")
+
+    gold_path = st.text_input(
+        "정답 라벨 경로 (선택)",
+        value=f"data/gold/meeting_{meeting_id}.json",
+        help="정답 액션아이템 JSON 파일입니다. 비워두면 proxy metric만 표시합니다.",
+    )
+
+    report = full_evaluation_report(
+        client,
+        meeting_id,
+        gold_path=gold_path or None,
+    )
+
+    st.markdown("**Proxy metrics** (정답 라벨 없이 저장 데이터로 계산)")
+    proxy_df = as_dataframe(
+        [{"metric": k, "value": v} for k, v in report.proxy.items()]
+    )
+    display_dataframe(proxy_df)
+
+    if report.has_gold:
+        st.markdown("**정답 라벨 평가**")
+        col1, col2, col3 = st.columns(3)
+        col1.metric("정밀도", report.precision)
+        col2.metric("재현율", report.recall)
+        col3.metric("F1", report.f1)
+
+        col4, col5 = st.columns(2)
+        col4.metric("담당자 정확도", report.assignee_accuracy)
+        col5.metric("분류 정확도", report.category_accuracy)
+
+        if report.per_category:
+            st.markdown("**분류별 P/R/F1**")
+            cat_rows = [
+                {
+                    "category": cat,
+                    "precision": m.precision,
+                    "recall": m.recall,
+                    "f1": m.f1,
+                    "predicted": m.predicted_count,
+                    "gold": m.gold_count,
+                }
+                for cat, m in report.per_category.items()
+            ]
+            display_dataframe(as_dataframe(cat_rows))
+
+        if report.matched_pairs:
+            with st.expander("매칭된 항목"):
+                display_dataframe(as_dataframe(report.matched_pairs))
+    else:
+        st.info(
+            "정답 라벨 파일이 없거나 찾을 수 없습니다. "
+            "정답 JSON을 제공하면 정밀도/재현율/F1을 볼 수 있습니다."
+        )
+
+
+def render_stt_review(client: object, meeting_id: str) -> None:
+    stt_runs = client.fetch_all(
+        """
+        SELECT *
+        FROM stt_runs
+        WHERE meeting_id = ?
+        ORDER BY created_at DESC
+        """,
+        (meeting_id,),
+    )
+    utterances = client.fetch_all(
+        """
+        SELECT sequence_no, speaker_raw, speaker_normalized, start_sec, end_sec, text
+        FROM utterances
+        WHERE meeting_id = ?
+        ORDER BY sequence_no
+        """,
+        (meeting_id,),
+    )
+
+    display_dataframe(as_dataframe(stt_runs))
+    display_dataframe(as_dataframe(utterances))
+
+
+def render_similar_decisions(client: object, meeting_id: str) -> None:
+    total_stored = vector_record_count()
+    meeting_stored = vector_record_count(meeting_id)
+
+    st.caption(f"Vector DB: 전체 {total_stored}건 (이 회의 {meeting_stored}건)")
+
+    st.divider()
+
+    with st.form("similar_search_form"):
+        search_scope = st.radio(
+            "검색 범위",
+            ["현재 회의", "전체 회의"],
+            horizontal=True,
+            help="'현재 회의'는 이 회의 아이템만, '전체 회의'는 모든 회의 아이템을 검색합니다.",
+        )
+        query = st.text_input("검색어", placeholder="예: ROAS 리포트 확인")
+        submitted = st.form_submit_button("검색")
+
+    if submitted and query.strip():
+        scope_meeting_id = meeting_id if search_scope == "현재 회의" else None
+        results = search_similar(client, query.strip(), top_k=5, meeting_id=scope_meeting_id)
+        if results:
+            display_dataframe(
+                as_dataframe(results)[
+                    [
+                        "description",
+                        "assignee_normalized",
+                        "category",
+                        "priority",
+                        "status",
+                        "final_confidence",
+                        "meeting_title",
+                        "similarity",
+                        "evidence_summary",
+                    ]
+                ],
+            )
+        else:
+            st.info("Vector DB에 저장된 임베딩이 없습니다. 먼저 임베딩을 생성하세요.")
+
+
+def build_action_summary_df(client: object, meeting_id: str) -> pd.DataFrame:
+    evidence_expr = _evidence_concat_sql(client)
+    group_by = _action_summary_group_by_sql(client)
+    rows = client.fetch_all(
+        f"""
+        SELECT
+            a.action_item_id,
+            a.sequence_no,
+            c.start_sequence_no,
+            a.assignee_normalized,
+            a.category,
+            a.priority,
+            a.status,
+            a.review_required,
+            a.final_confidence,
+            a.description,
+            {evidence_expr} AS evidence_summary
+        FROM action_items a
+        LEFT JOIN chunks c ON c.chunk_id = a.chunk_id
+        LEFT JOIN action_item_sources s ON s.action_item_id = a.action_item_id
+        LEFT JOIN utterances u ON u.utterance_id = s.utterance_id
+        WHERE a.meeting_id = ?
+        GROUP BY {group_by}
+        ORDER BY
+            CASE WHEN a.due_date IS NOT NULL THEN 0 ELSE 1 END ASC,
+            a.due_date ASC,
+            CASE a.priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END ASC,
+            COALESCE(c.start_sequence_no, a.sequence_no) ASC,
+            a.sequence_no ASC
+        """,
+        (meeting_id,),
+    )
+    df = as_dataframe(rows)
+    if df.empty:
+        return df
+    df = _with_action_numbers(df)
+    df = _attach_display_description_from_evidence(df)
+    return df[
+        [
+            "action_no",
+            "assignee_normalized",
+            "display_description",
+            "category",
+            "priority",
+            "status",
+            "review_required",
+            "final_confidence",
+            "evidence_summary",
+        ]
+]
+
+
+def _add_display_descriptions(
+    client: object,
+    meeting_id: str,
+    action_df: pd.DataFrame,
+) -> pd.DataFrame:
+    if action_df.empty:
+        return action_df
+
+    text_concat_expr = _text_concat_sql(client)
+    evidence_rows = client.fetch_all(
+        f"""
+        SELECT
+            a.action_item_id,
+            {text_concat_expr} AS evidence_summary
+        FROM action_items a
+        LEFT JOIN action_item_sources s ON s.action_item_id = a.action_item_id
+        LEFT JOIN utterances u ON u.utterance_id = s.utterance_id
+        WHERE a.meeting_id = ?
+        GROUP BY a.action_item_id
+        """,
+        (meeting_id,),
+    )
+    evidence_by_action = {
+        row["action_item_id"]: row.get("evidence_summary") or ""
+        for row in evidence_rows
+    }
+
+    enriched = action_df.copy()
+    enriched["evidence_summary"] = enriched["action_item_id"].map(evidence_by_action)
+    return _attach_display_description_from_evidence(enriched)
+
+
+def _evidence_concat_sql(client: object) -> str:
+    if isinstance(client, PostgreSQLClient):
+        return "STRING_AGG('[' || u.sequence_no || '] ' || u.speaker_raw || ': ' || u.text, CHR(10) ORDER BY u.sequence_no)"
+    return "GROUP_CONCAT('[' || u.sequence_no || '] ' || u.speaker_raw || ': ' || u.text, CHAR(10))"
+
+
+def _text_concat_sql(client: object) -> str:
+    if isinstance(client, PostgreSQLClient):
+        return "STRING_AGG(u.text, CHR(10) ORDER BY u.sequence_no)"
+    return "GROUP_CONCAT(u.text, CHAR(10))"
+
+
+def _action_summary_group_by_sql(client: object) -> str:
+    # PostgreSQL requires all non-aggregate SELECT columns in GROUP BY
+    if isinstance(client, PostgreSQLClient):
+        return (
+            "a.action_item_id, a.sequence_no, c.start_sequence_no, "
+            "a.assignee_normalized, a.category, a.priority, a.status, "
+            "a.review_required, a.final_confidence, a.description"
+        )
+    return "a.action_item_id, c.start_sequence_no"
+
+
+def _attach_display_description_from_evidence(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    enriched = df.copy()
+    enriched["display_description"] = enriched.apply(_display_description, axis=1)
+    return enriched
+
+
+def _display_description(row: pd.Series) -> str:
+    description = str(row.get("description") or "").strip()
+    if description and not _is_generic_description(description):
+        return description
+
+    evidence = str(row.get("evidence_summary") or "")
+    inferred = _infer_task_from_evidence(evidence)
+    return inferred or description or "후속 작업 내용을 확인한다"
+
+
+def _is_generic_description(description: str) -> bool:
+    generic_markers = [
+        "회의에서 언급된 후속 작업",
+        "후속 작업을 진행",
+        "후속 작업을 확인",
+        "관련 작업을 진행",
+    ]
+    return any(marker in description for marker in generic_markers)
+
+
+def _infer_task_from_evidence(evidence: str) -> str:
+    text = " ".join(evidence.split())
+    rules = [
+        (
+            ["헤드라인", "AB", "카피"],
+            "변경된 카피로 헤드라인 A/B 테스트를 다시 세팅한다",
+        ),
+        (
+            ["비주얼 카드", "빈 슬롯", "카피"],
+            "비주얼 카드 순서와 빈 슬롯 카피를 정리한다",
+        ),
+        (
+            ["담당자", "푸시", "임시 컷"],
+            "담당자에게 추가 푸시하고 미응답 시 임시 컷으로 진행한다",
+        ),
+        (
+            ["픽셀 보장", "다시 드릴게요"],
+            "픽셀 보장 내용을 다시 전달한다",
+        ),
+        (
+            ["픽셀 정리", "같이 챙길게요"],
+            "픽셀 정리 이후 관련 후속 이슈를 함께 챙긴다",
+        ),
+        (
+            ["인사이트", "비주얼", "톤"],
+            "지난 캠페인 인사이트를 기준으로 비주얼 톤을 결정한다",
+        ),
+        (
+            ["캠페인", "정리할 게"],
+            "다음 달 캠페인 전 정리 항목을 확인한다",
+        ),
+    ]
+
+    for keywords, task in rules:
+        if all(keyword in text for keyword in keywords):
+            return task
+    return _first_action_like_sentence(text)
+
+
+def _first_action_like_sentence(text: str) -> str:
+    for sentence in _split_sentences(text):
+        if any(marker in sentence for marker in ["할게", "드릴게", "정리", "세팅", "진행", "확인", "챙기"]):
+            return sentence
+    return ""
+
+
+def _split_sentences(text: str) -> list[str]:
+    normalized = text.replace("?", ".").replace("!", ".")
+    return [part.strip() for part in normalized.split(".") if part.strip()]
+
+
+def _risk_summary_metric(risk_summary_df: pd.DataFrame) -> str:
+    if risk_summary_df.empty:
+        return "없음"
+    top = risk_summary_df.iloc[0]
+    if len(risk_summary_df) == 1:
+        return str(top["risk_flag"])
+    return f"{top['risk_flag']} 외 {len(risk_summary_df) - 1}종"
+
+
+def _build_review_reason_df(action_df: pd.DataFrame) -> pd.DataFrame:
+    df = _with_action_numbers(action_df.copy())
+    if "risk_flags_json" not in df.columns:
+        df["risk_flags_json"] = "[]"
+    if "review_required" not in df.columns:
+        df["review_required"] = 0
+
+    df["risk_flags"] = df["risk_flags_json"].apply(_parse_risk_flags)
+    df["review_reason"] = df.apply(_review_reason, axis=1)
+    return df
+
+
+def _build_risk_flag_summary_df(review_df: pd.DataFrame) -> pd.DataFrame:
+    counts: dict[str, int] = {}
+    for flags in review_df.get("risk_flags", []):
+        for flag in flags:
+            label = RISK_FLAG_LABELS.get(flag, flag)
+            counts[label] = counts.get(label, 0) + 1
+
+    if not counts:
+        return pd.DataFrame()
+
+    rows = [
+        {"risk_flag": flag, "count": count}
+        for flag, count in sorted(counts.items(), key=lambda item: item[1], reverse=True)
+    ]
+    return pd.DataFrame(rows)
+
+
+def _quality_table(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    review_df = _build_review_reason_df(df)
+    columns = [
+        "action_no",
+        "assignee_normalized",
+        "display_description",
+        "llm_confidence",
+        "validation_score",
+        "final_confidence",
+        "review_required",
+        "review_reason",
+    ]
+    return review_df[[col for col in columns if col in review_df.columns]]
+
+
+def _parse_risk_flags(value: object) -> list[str]:
+    if isinstance(value, list):
+        return [str(flag) for flag in value]
+    if not value:
+        return []
+    try:
+        parsed = json.loads(str(value))
+    except json.JSONDecodeError:
+        return [str(value)]
+    if isinstance(parsed, list):
+        return [str(flag) for flag in parsed]
+    return [str(parsed)]
+
+
+def _review_reason(row: pd.Series) -> str:
+    flags = row.get("risk_flags", [])
+    reasons = [RISK_FLAG_LABELS.get(flag, flag) for flag in flags]
+
+    final_confidence = float(row.get("final_confidence") or 0)
+    if final_confidence < 0.7:
+        reasons.append("최종 신뢰도 0.7 미만")
+
+    if reasons:
+        return ", ".join(dict.fromkeys(reasons))
+    if bool(row.get("review_required")):
+        return "검토 필요로 표시됨"
+    return "검토 불필요"
+
+
+def _with_action_numbers(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or "action_no" in df.columns:
+        return df
+    numbered = df.copy()
+    numbered.insert(0, "action_no", range(1, len(numbered) + 1))
+    return numbered
+
+
+def _sort_actions(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    df = df.copy()
+    # due_date가 있으면 가장 빠른 날짜 우선, null은 후순위
+    df["_due"] = pd.to_datetime(df.get("due_date"), errors="coerce")
+    df["_has_due"] = df["_due"].notna().astype(int)
+    priority_rank = {"high": 0, "medium": 1, "low": 2}
+    df["_pri"] = df.get("priority", pd.Series("medium", index=df.index)).map(priority_rank).fillna(1)
+    seq_cols = [c for c in ["start_sequence_no", "sequence_no", "action_item_id"] if c in df.columns]
+    sorted_df = df.sort_values(
+        ["_has_due", "_due", "_pri"] + seq_cols,
+        ascending=[False, True, True] + [True] * len(seq_cols),
+    ).reset_index(drop=True)
+    return sorted_df.drop(columns=["_due", "_has_due", "_pri"])
+
+
+def _priority_reason(row: object) -> str:
+    get_value = row.get if hasattr(row, "get") else lambda key, default=None: default
+    priority = get_value("priority", "medium")
+    evidence = f"{get_value('description', '')} {get_value('evidence_summary', '')}".lower()
+    if priority == "high":
+        if any(marker in evidence for marker in ["오늘", "내일", "오전까지", "이번 주", "바로", "급", "안 오면", "컨펌"]):
+            return "마감/긴급/블로킹 표현이 포함됨"
+        return "추출기가 높은 우선순위로 분류"
+    if priority == "low":
+        return "추후/선택적 후속 작업 성격"
+    return "명확한 긴급 마감이 없어 기본 후속 작업으로 분류"
+
+
+def _meeting_label(meeting_df: pd.DataFrame, meeting_id: str) -> str:
+    row = meeting_df[meeting_df["meeting_id"] == meeting_id].iloc[0]
+    return f"{row['title']} ({meeting_id})"
+
+
+def _action_label(action_df: pd.DataFrame, action_item_id: str) -> str:
+    row = action_df[action_df["action_item_id"] == action_item_id].iloc[0]
+    prefix = f"액션 아이템 {row['action_no']} " if "action_no" in row else ""
+    return f"{prefix}{row['assignee_normalized']} - {row['description']}"
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,61 @@
+{
+  "meeting_id": "ddf3f8424cac1b09",
+  "gold_action_items": [
+    {
+      "description": "픽셀 이벤트 중복 발화 보정 후 전환 수치 재계산하여 내일 오전 공유",
+      "assignee_normalized": "performance_marketer",
+      "category": "performance",
+      "due_date": null,
+      "priority": "high"
+    },
+    {
+      "description": "캠페인 세트 분리 작업 수요일 오전까지 완료 후 광고주 컨펌 요청",
+      "assignee_normalized": "performance_marketer",
+      "category": "performance",
+      "due_date": null,
+      "priority": "medium"
+    },
+    {
+      "description": "헤드라인 카피 변경 후 기존 A/B 테스트 닫고 새 카피로 재세팅",
+      "assignee_normalized": "performance_marketer",
+      "category": "performance",
+      "due_date": null,
+      "priority": "medium"
+    },
+    {
+      "description": "CTA 버튼 변경 후 전환 추적 이벤트 재확인",
+      "assignee_normalized": "performance_marketer",
+      "category": "performance",
+      "due_date": null,
+      "priority": "medium"
+    },
+    {
+      "description": "비주얼 카드 순서 및 빈 슬롯 카피 1차 작성",
+      "assignee_normalized": "content_designer",
+      "category": "creative",
+      "due_date": null,
+      "priority": "high"
+    },
+    {
+      "description": "메인 헤드라인, 랜딩 첫 화면, CTA 필수 카피 3개 수정",
+      "assignee_normalized": "content_designer",
+      "category": "creative",
+      "due_date": null,
+      "priority": "high"
+    },
+    {
+      "description": "광고주에게 신제품 누끼 컷 재요청 및 미수신 시 임시 컷으로 진행 결정",
+      "assignee_normalized": "team_lead",
+      "category": "creative",
+      "due_date": null,
+      "priority": "high"
+    },
+    {
+      "description": "캠페인 운영 계정 변경 관련 광고주 컨펌 수령",
+      "assignee_normalized": "team_lead",
+      "category": "performance",
+      "due_date": null,
+      "priority": "medium"
+    }
+  ]
+}

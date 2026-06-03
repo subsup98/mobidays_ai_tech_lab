@@ -1,0 +1,10 @@
+# Install after requirements.txt when running the full audio pipeline.
+# These packages are heavier and may require platform-specific binaries.
+# pyannote diarization requires a Hugging Face token and model user-condition approval.
+
+faster-whisper>=1.0,<2
+huggingface-hub>=0.24,<1
+torch==2.3.1
+torchaudio==2.3.1
+pyannote.audio==3.4.0
+speechbrain>=1.0.0

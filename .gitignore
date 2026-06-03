@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environment
+.venv/
+.venv-nemo/
+.venv-pyannote4/
+venv/
+env/
+
+# Secrets
+.env
+*.key
+
+# Local data and generated artifacts
+data/raw/*
+data/interim/*
+data/processed/*
+data/bench/
+data/vector/
+data/*.db
+data/**/*.db
+*.sqlite
+*.sqlite3
+
+# Keep demo transcript and directory placeholders
+!data/sample_transcript.json
+!data/raw/.gitkeep
+!data/interim/.gitkeep
+!data/processed/.gitkeep
+
+# Claude Code local settings
+.claude/
+
+# Development-only notes
+worklog.md
+agent.md
+
+# OS and editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

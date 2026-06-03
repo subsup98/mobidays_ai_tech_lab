@@ -1,0 +1,87 @@
+{
+  "meeting": {
+    "meeting_id": "demo_meeting_001",
+    "title": "노바드림 캠페인 사전 정렬 회의",
+    "meeting_date": "2026-06-01",
+    "audio_path": null,
+    "audio_hash": null,
+    "transcript_path": "data/sample_transcript.json",
+    "source_type": "mock"
+  },
+  "participants": [
+    {
+      "participant_id": "demo_p1",
+      "meeting_id": "demo_meeting_001",
+      "speaker_raw": "SPEAKER_00",
+      "speaker_normalized": "team_lead",
+      "role": "team_lead",
+      "confidence": 0.9
+    },
+    {
+      "participant_id": "demo_p2",
+      "meeting_id": "demo_meeting_001",
+      "speaker_raw": "SPEAKER_01",
+      "speaker_normalized": "performance_marketer",
+      "role": "performance_marketer",
+      "confidence": 0.9
+    },
+    {
+      "participant_id": "demo_p3",
+      "meeting_id": "demo_meeting_001",
+      "speaker_raw": "SPEAKER_02",
+      "speaker_normalized": "content_designer",
+      "role": "content_designer",
+      "confidence": 0.9
+    }
+  ],
+  "utterances": [
+    {
+      "utterance_id": "demo_u1",
+      "meeting_id": "demo_meeting_001",
+      "participant_id": "demo_p1",
+      "speaker_raw": "SPEAKER_00",
+      "speaker_normalized": "team_lead",
+      "text": "노바드림 캠페인 ROAS 리포트는 제가 정리할게요.",
+      "start_sec": 1.0,
+      "end_sec": 5.0,
+      "sequence_no": 1,
+      "source": "mock"
+    },
+    {
+      "utterance_id": "demo_u2",
+      "meeting_id": "demo_meeting_001",
+      "participant_id": "demo_p2",
+      "speaker_raw": "SPEAKER_01",
+      "speaker_normalized": "performance_marketer",
+      "text": "CPM이 오른 원인은 제가 오늘 확인하겠습니다.",
+      "start_sec": 5.2,
+      "end_sec": 9.1,
+      "sequence_no": 2,
+      "source": "mock"
+    },
+    {
+      "utterance_id": "demo_u3",
+      "meeting_id": "demo_meeting_001",
+      "participant_id": "demo_p3",
+      "speaker_raw": "SPEAKER_02",
+      "speaker_normalized": "content_designer",
+      "text": "CTA 문구는 A/B 테스트용으로 두 가지 버전을 만들겠습니다.",
+      "start_sec": 9.4,
+      "end_sec": 14.0,
+      "sequence_no": 3,
+      "source": "mock"
+    },
+    {
+      "utterance_id": "demo_u4",
+      "meeting_id": "demo_meeting_001",
+      "participant_id": "demo_p1",
+      "speaker_raw": "SPEAKER_00",
+      "speaker_normalized": "team_lead",
+      "text": "예산 변경안은 다음 회의 전에 공유해주세요.",
+      "start_sec": 14.2,
+      "end_sec": 18.0,
+      "sequence_no": 4,
+      "source": "mock"
+    }
+  ]
+}

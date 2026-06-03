@@ -42,18 +42,9 @@ class PyannoteDiarizer:
             or DEFAULT_DIARIZATION_MODEL
         )
         self.auth_token = auth_token or os.getenv("HUGGINGFACE_TOKEN")
-        env_num_speakers = os.getenv("DIARIZATION_NUM_SPEAKERS")
-        env_min_speakers = os.getenv("DIARIZATION_MIN_SPEAKERS")
-        env_max_speakers = os.getenv("DIARIZATION_MAX_SPEAKERS")
-        self.num_speakers = num_speakers or (
-            int(env_num_speakers) if env_num_speakers else None
-        )
-        self.min_speakers = min_speakers or (
-            int(env_min_speakers) if env_min_speakers else None
-        )
-        self.max_speakers = max_speakers or (
-            int(env_max_speakers) if env_max_speakers else None
-        )
+        self.num_speakers = num_speakers
+        self.min_speakers = min_speakers
+        self.max_speakers = max_speakers
         self._pipeline: Pipeline | None = None
 
     @property

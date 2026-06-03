@@ -256,8 +256,8 @@ def normalized_task_signature(description: str) -> str:
     return ":".join(dict.fromkeys(tokens))
 
 
-def build_action_item_id(meeting_id: str, chunk_id: str | None, sequence_no: int) -> str:
-    return stable_hash(meeting_id, chunk_id or "no_chunk", sequence_no)
+def build_action_item_id(meeting_id: str, dedup_key: str) -> str:
+    return stable_hash(meeting_id, dedup_key)
 
 
 def build_dedup_key(
@@ -311,21 +311,37 @@ def materialize_action_item(
     extracted: ExtractedActionItem,
     extraction_run_id: str | None = None,
     confidence_threshold: float = 0.7,
+    meeting_date: date | None = None,
 ) -> ActionItem:
+    # LLM이 due_date를 비웠어도 설명에 상대 시간 표현이 있으면 회의일 기준으로
+    # 절대 날짜를 채운다(README "상대 기한 해석" 가정). due_date가 채워지면
+    # compute_validation_score가 due_date_missing 플래그를 붙이지 않는다.
+    if extracted.due_date is None and meeting_date is not None:
+        from extraction.due_date_parser import parse_due_date
+
+        parsed = parse_due_date(extracted.description, meeting_date)
+        if parsed is not None:
+            extracted = extracted.model_copy(update={"due_date": parsed})
+
     task_signature = normalized_task_signature(extracted.description)
     validation_score, risk_flags = compute_validation_score(extracted)
     final_confidence = min(extracted.llm_confidence, validation_score)
     review_required = final_confidence < confidence_threshold or bool(risk_flags)
 
+    dedup_key = build_dedup_key(
+        meeting_id=meeting_id,
+        assignee_normalized=extracted.assignee_normalized,
+        category=extracted.category,
+        due_date=extracted.due_date,
+        task_signature=task_signature,
+    )
+
     return ActionItem(
-        action_item_id=build_action_item_id(meeting_id, chunk_id, sequence_no),
-        dedup_key=build_dedup_key(
-            meeting_id=meeting_id,
-            assignee_normalized=extracted.assignee_normalized,
-            category=extracted.category,
-            due_date=extracted.due_date,
-            task_signature=task_signature,
-        ),
+        # dedup_key 기반으로 PK를 생성해 PK와 UNIQUE(meeting_id, dedup_key)가
+        # 항상 일치하게 한다. chunk_id+sequence_no 기반은 같은 배치에서 PK는
+        # 같은데 dedup_key는 다른 조합이 생겨 action_items_pkey 충돌을 유발했다.
+        action_item_id=build_action_item_id(meeting_id, dedup_key),
+        dedup_key=dedup_key,
         meeting_id=meeting_id,
         chunk_id=chunk_id,
         extraction_run_id=extraction_run_id,

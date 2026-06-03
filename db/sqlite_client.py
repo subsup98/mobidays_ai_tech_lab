@@ -8,7 +8,7 @@ from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "app.db"
+DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "app_quality.db"
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
 

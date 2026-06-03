@@ -1,8 +1,8 @@
 # 모비데이즈 회의 액션아이템 자동화 시스템
 
-> **한 줄 실행**: `.\run.ps1`
+> **한 줄 실행(환경설정 + 샘플 데이터 데모)**: `.\run.ps1`
 
-회의 음성(mp3) 또는 transcript JSON을 입력받아 액션아이템을 자동 추출하고, SQLite/PostgreSQL에 적재한 뒤 Streamlit 대시보드에서 운영자가 확인·관리할 수 있는 PoC입니다.
+회의 음성(mp3) 또는 transcript JSON을 입력받아 Gemini API로 액션아이템을 자동 추출하고, PostgreSQL에 적재한 뒤 Streamlit 대시보드에서 운영자가 확인·관리할 수 있는 PoC입니다.
 
 ---
 
@@ -31,17 +31,17 @@
 [preprocessing] 화자 정규화 → 중복 제거 → 청크화 (최대 4발화/청크, glossary 기반 topic hint)
          │
          ▼
-[extraction] GeminiExtractor  ──실패──▶  MockExtractor (fallback)
+[extraction] GeminiExtractor
          │  structured JSON (담당자·기한·카테고리·신뢰도·위험신호)
          │
          ▼
 [validation] validation_score 계산 → dedup_key 중복 제거 → DB 저장
          │
          ▼
-[db] SQLite (기본) / PostgreSQL (운영)
+[db] PostgreSQL
          │
          ▼
-[dashboard] Streamlit 5탭 + FAISS 유사도 검색
+[dashboard] Streamlit 7탭 + FAISS 유사도 검색
 ```
 
 ### 모듈 분리 기준
@@ -50,8 +50,10 @@
 |---|---|---|
 | `ingestion/` | 오디오·JSON 로드, STT, 화자분리, Transcript 조립 | 입력 포맷 다양성 흡수. STT 재실행이 추출 결과에 영향을 주지 않도록 격리 |
 | `preprocessing/` | 화자 정규화, 청크 생성, 도메인 용어 처리 | 청킹 정책 변경 시 extraction 재실행만 하면 되도록 단계 분리 |
-| `extraction/` | LLM 호출, 검증, fallback | LLM 교체(Gemini→Ollama 등) 시 extractor만 교체하면 됨 |
+| `extraction/` | Gemini LLM 호출, 스키마 검증, 재시도 | LLM 교체(Gemini→Ollama 등) 시 extractor만 교체하면 됨 |
+| `db/` | PostgreSQL 스키마 초기화, upsert, 상태 변경 이력 저장 | 저장소 계층을 파이프라인·대시보드 코드에서 분리 |
 | `analytics/` | 신뢰도 분석, 키워드 추출, 임베딩 | 대시보드 집계 로직을 앱 코드에서 분리해 단독 테스트 가능 |
+| `integrations/` | Slack mock payload 생성 | 실제 외부 전송 없이 페이로드 구조와 운영 알림 흐름 검증 |
 | `dashboard/` | Streamlit UI | 백엔드 로직과 분리해 UI 교체 여지 확보 |
 
 ### 핵심 테이블 구조
@@ -84,91 +86,114 @@ meetings
 
 ## 실행 방법
 
-### 사전 준비
+| 모드 | 명령 | 설명 |
+|---|---|---|
+| 기본 데모 (STT 없음) | `.\run.ps1` | 환경설정, 패키지 설치, 샘플 transcript 처리, 대시보드 실행까지 한 번에 수행합니다. 제출 확인용 기본 경로입니다. |
+| STT 음성 입력 | `.\run.ps1 -InputMode audio -InputPath "C:\path\meeting.mp3"` | 실제 음성 파일을 STT·화자분리 후 처리합니다. 오디오 모드에서만 `requirements-stt.txt`를 자동 설치합니다. |
+
+### 빠른 테스트
 
 Python 3.10+ 및 Git이 설치되어 있어야 합니다.
-
-```powershell
-# 가상환경 생성 및 기본 패키지 설치
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-```
-
-STT·화자분리 기능까지 사용하려면 추가 설치가 필요합니다 (CUDA 환경 권장, CPU도 동작):
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements-stt.txt
-```
-
-### 환경 변수 설정
-
-`.env.example`을 `.env`로 복사 후 필요한 항목을 채웁니다.
-
-```powershell
-Copy-Item .env.example .env
-```
-
-```env
-# Gemini 실제 추출 시 필요 (없으면 mock 모드로 자동 동작)
-GEMINI_API_KEY=your_key_here
-
-# STT·화자분리 시 필요 (없으면 transcript JSON 입력 모드 사용)
-HUGGINGFACE_TOKEN=your_token_here
-```
-
-### 빠른 데모 (API 키 없이)
 
 ```powershell
 .\run.ps1
 ```
 
-브라우저에서 `http://localhost:8501` 접속. 샘플 transcript가 자동으로 파이프라인을 통과하고 대시보드가 열립니다.
+최초 실행 시 `run.ps1`이 `.venv` 생성, `requirements.txt` 설치, `.env.example` 복사를 자동으로 수행합니다. 이후 샘플 transcript를 파이프라인에 넣고 대시보드를 실행합니다.
+
+실제 Gemini 추출을 사용하려면 `.env`의 `GEMINI_API_KEY`를 채웁니다. 키가 없으면 mock extractor fallback으로 로컬 데모 확인이 가능합니다.
+
+```env
+GEMINI_API_KEY=your_key_here
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/mobidays_app
+```
+
+Git clone 후 포함되는 `data/sample_transcript.json`을 기본 입력으로 사용합니다. 이 모드는 STT와 화자분리를 생략하므로 `requirements-stt.txt`를 설치하지 않습니다.
+
+### 실제 입력 테스트
+
+mp3, wav, m4a, flac 파일을 직접 입력하면 `run.ps1`이 STT·화자분리 의존성을 자동 설치합니다.
+
+`.env`에 HuggingFace 토큰과 pyannote 모델 설정을 추가합니다.
+
+```env
+HUGGINGFACE_TOKEN=your_token_here
+DIARIZATION_MODEL=pyannote/speaker-diarization-3.1
+```
+
+```powershell
+.\run.ps1 -InputMode audio -InputPath "C:\path\meeting.mp3"
+```
+
+회의 참여 인원 수를 알고 있을 때만 힌트를 추가합니다.
+
+```powershell
+.\run.ps1 -InputMode audio -InputPath "C:\path\meeting.mp3" -NumSpeakers 3
+```
+
+브라우저에서 `http://localhost:8501` 접속. 파이프라인 실행 후 대시보드가 열립니다.
 
 ### 파이프라인 단독 실행
 
-**Transcript JSON 입력 (추천, STT 불필요)**
+**Transcript JSON 입력**
 
 ```powershell
-$env:LLM_PROVIDER="mock"
+$env:DB_BACKEND="postgres"
+$env:DATABASE_URL="postgresql://postgres:postgres@localhost:5432/mobidays_app"
+$env:LLM_PROVIDER="gemini"
+$env:GEMINI_API_KEY="your_key"
 .\.venv\Scripts\python.exe pipeline.py `
   --input data/interim/model_comparison_large_auto/transcript_large-v3_speakers-auto.json `
   --input-mode transcript `
-  --db data/app.db
+  --db-backend postgres `
+  --pg-dsn $env:DATABASE_URL
 ```
 
 **음성 파일 입력**
 
 ```powershell
+$env:DB_BACKEND="postgres"
+$env:DATABASE_URL="postgresql://postgres:postgres@localhost:5432/mobidays_app"
+$env:LLM_PROVIDER="gemini"
+$env:GEMINI_API_KEY="your_key"
+$env:HUGGINGFACE_TOKEN="your_token"
 .\.venv\Scripts\python.exe pipeline.py `
   --input data/raw/sample.mp3 `
   --input-mode audio `
-  --db data/app.db
+  --db-backend postgres `
+  --pg-dsn $env:DATABASE_URL
 ```
 
 **Gemini 실제 추출 모드**
 
 ```powershell
+$env:DB_BACKEND="postgres"
+$env:DATABASE_URL="postgresql://postgres:postgres@localhost:5432/mobidays_app"
 $env:LLM_PROVIDER="gemini"
 $env:GEMINI_API_KEY="your_key"
 .\.venv\Scripts\python.exe pipeline.py `
   --input data/sample_transcript.json `
   --input-mode transcript `
-  --db data/app.db
+  --db-backend postgres `
+  --pg-dsn $env:DATABASE_URL
 ```
 
 ### 대시보드
 
-**SQLite 모드 (기본)**
-
-```powershell
-.\.venv\Scripts\streamlit.exe run dashboard/app.py
-```
-
-**PostgreSQL + Vector DB 모드**
+**PostgreSQL + Vector DB 모드 (기본 제출 실행)**
 
 ```powershell
 $env:DB_BACKEND="postgres"
 $env:DATABASE_URL="postgresql://postgres:postgres@localhost:5432/mobidays_app"
+$env:VECTOR_DB_PATH="data/vector/faiss_action_items"
+.\.venv\Scripts\streamlit.exe run dashboard/app.py
+```
+
+**SQLite 개발용 모드**
+
+```powershell
+$env:DB_BACKEND="sqlite"
+$env:DATABASE_PATH="data/app_quality.db"
 $env:VECTOR_DB_PATH="data/vector/faiss_action_items"
 .\.venv\Scripts\streamlit.exe run dashboard/app.py
 ```
@@ -179,11 +204,13 @@ $env:VECTOR_DB_PATH="data/vector/faiss_action_items"
 
 | 탭 | 기능 |
 |---|---|
-| 전체 현황 | 회의별 액션 추이, 상태별 현황, 담당자별 미완료 Top N, 이슈 키워드 |
+| 전체 현황 | 회의별 액션 추이, 상태별 현황, 담당 역할별 미완료 Top N, 이슈 키워드 |
 | 액션 운영 | 액션 상세 조회, 상태 변경, 근거 발화 확인, Slack 페이로드 생성 |
 | 품질 점검 | 신뢰도 분포, 위험 신호 요약, 검토 필요 항목 목록 |
 | STT 검토 | 발화 원문 및 타임스탬프 확인 |
 | 유사도 검색 | 과거 유사 액션아이템 FAISS 검색 |
+| 회의 업로드 | 로컬 음성/영상 파일 업로드 후 파이프라인 실행 |
+| 가이드 | 로컬 실행 가이드, Gemini API·HuggingFace 토큰 준비 안내, 녹화 영상 업로드/재생 |
 
 ---
 
@@ -193,8 +220,8 @@ $env:VECTOR_DB_PATH="data/vector/faiss_action_items"
 |---|---|---|---|
 | **STT** | faster-whisper (local, large-v3) | Whisper API, Clova | 무료·오프라인 동작. 4종 모델 비교 실험에서 large-v3가 발화 수(42개)가 레퍼런스(37개)에 가장 근접하고 키워드 재현율 1.000 달성 |
 | **화자분리** | pyannote/speaker-diarization-3.1 | NeMo Sortformer, pyannote community-1 | 3종 비교 결과 모두 2화자 감지 (레퍼런스 3명). 화자 수 불일치는 오디오 특성 문제이며, pyannote 3.1이 설치 단순·처리 속도 우위 |
-| **LLM 추출** | Gemini 2.5 Flash Lite | GPT-4o, Claude | 무료 티어 내 한국어 구조화 출력 품질 확보. API 오류 시 mock fallback으로 파이프라인 중단 없음 |
-| **DB** | SQLite (기본) / PostgreSQL (운영) | DuckDB, MySQL | SQLite는 설치 없이 로컬 재현 가능. DB 벤치마크(`experiments/db_benchmark.py`) 수행 결과 집계 쿼리 성능 충분. 다중 접속 확장 시 PostgreSQL 전환 |
+| **LLM 추출** | Gemini 2.5 Flash Lite | GPT-4o, Claude | 무료 티어 내 한국어 구조화 출력 품질 확보. 최종 제출 실행은 Gemini API 기준으로 구성 |
+| **DB** | PostgreSQL | SQLite, DuckDB, MySQL | 200명 미만 사용자가 여러 팀에서 회의 데이터를 매주·매일 업로드하는 운영 형태를 가정해 PostgreSQL을 기본 DB로 사용 |
 | **대시보드** | Streamlit | React, Metabase | Python 단일 스택, 마케터 직접 운영 대상. 빠른 프로토타이핑 가능 |
 | **벡터 DB** | FAISS (로컬) | ChromaDB, Pinecone | 600건 기준 평균 쿼리 0.060ms (Chroma 6.653ms 대비 약 111배 빠름). PostgreSQL이 메타데이터를 담당하므로 Chroma의 문서 관리 기능이 불필요 |
 | **임베딩** | sentence-transformers (local) | Gemini text-embedding | API 키 없이 의미 검색 동작. 한국어 지원 모델 직접 선택 가능 |
@@ -239,7 +266,7 @@ FAISS가 빌드·쿼리 모두 압도적으로 빠릅니다. PostgreSQL이 이�
 
 **DB 선택 근거 (벤치마크 요약)**
 
-`experiments/db_benchmark.py`로 SQLite·DuckDB·PostgreSQL 3종을 비교했습니다. 50~200행 규모 PoC에서는 세 DB 모두 응답 속도 차이가 미미했고, SQLite가 설치 없이 단일 파일로 재현 가능하다는 점이 리뷰어 편의성 측면에서 결정적이었습니다. 자세한 수치는 `docs/db_benchmark.md`를 참고하세요.
+`experiments/db_benchmark.py`로 SQLite·DuckDB·PostgreSQL 3종을 비교했습니다. 50~200행 규모 PoC에서는 세 DB 모두 응답 속도 차이가 미미했습니다. PostgreSQL은 회의, 발화, 액션아이템, 상태 변경 이력을 관계형 구조로 안정적으로 관리하기에 적합해 기본 DB로 채택했습니다. 자세한 수치는 `docs/db_benchmark.md`를 참고하세요.
 
 ---
 
@@ -273,7 +300,7 @@ LLM 응답은 3단계를 거칩니다:
    - 중복 제거
 ```
 
-파싱 실패 시 최대 3회 재시도하며, 3회 모두 실패하면 MockExtractor로 자동 폴백합니다. `extraction_runs` 테이블에 재시도 횟수와 오류 내용을 기록해 추후 프롬프트 개선에 활용합니다.
+파싱 실패 시 최대 3회 재시도하며, `extraction_runs` 테이블에 재시도 횟수와 오류 내용을 저장해 추후 프롬프트 개선에 활용합니다.
 
 **5. 이중 신뢰도 분리**
 
@@ -285,9 +312,11 @@ LLM 응답은 3단계를 거칩니다:
 
 | 항목 | 가정 내용 | 이유 |
 |---|---|---|
-| **화자 수** | STT·화자분리 결과를 그대로 사용 (고정값 미설정) | 샘플 transcript는 3명이지만 pyannote가 2명으로 분리했습니다. 실수를 숨기지 않고 STT 검토 탭에 노출해 리뷰어가 직접 확인할 수 있도록 했습니다 |
+| **화자 수** | 기본은 모델 자동 판단, 필요 시 `--num-speakers` 또는 업로드 탭의 화자 수 힌트 제공 | 실제 회의는 참석자 수를 대략 알 수 있는 경우가 많으므로 힌트를 제공하면 화자 분리 오류를 줄일 수 있습니다. 자동 감지 결과가 실제와 다를 때도 STT 검토 탭에 노출해 운영자가 확인할 수 있도록 했습니다 |
 | **화자 정규화** | 발화 순서 기반 (첫 발화자 = team_lead) | 참가자 명단이 없으므로 발화 순서와 "팀장님" 같은 호칭으로 추론. 실제 배포 시 참가자 프로필 매핑으로 교체 가능 |
 | **기한 없는 액션** | `due_date_missing` 위험 신호 마킹, 삭제하지 않음 | 마케팅 회의에서 기한 미언급 액션이 다수입니다. 삭제하면 실제 업무가 누락되므로 플래그만 표시하고 운영자 판단에 맡깁니다 |
+| **상대 기한 해석** | 회의일을 기준일("오늘")로 보고 상대 시간 표현을 절대 날짜로 환산 (예: "내일" = 회의일 + 1일, "이번 주 수요일" = 회의 주의 수요일) | 회의록에는 "내일 오전", "수요일까지"처럼 상대 표현이 대부분이라 절대 날짜로 환산하려면 기준일이 필요합니다. 회의 메타데이터의 회의 날짜를 기준일로 가정하면 별도 입력 없이 기한을 채울 수 있습니다 |
+| **평가용 정답 데이터셋** | 추출 품질 평가 지표(정밀도·재현율 등) 산출 시 사람이 라벨링한 정답(ground-truth) 액션 아이템 데이터셋이 존재한다고 가정 | 자동 추출 결과의 정량 평가에는 비교 기준이 되는 정답셋이 필요합니다. 본 제출에서는 정답셋을 직접 포함하지 않으나, 평가 파이프라인은 정답셋이 주어지면 동작하도록 설계했습니다 |
 | **Gemini 무료 티어** | 분당 15 RPM 한도 내에서 청크 단위 순차 처리 | 무료 티어 유지를 위해 병렬 처리를 사용하지 않았습니다. 유료 전환 시 `asyncio.gather`로 교체 가능 |
 | **Slack 연동** | Mock payload 생성 (실제 전송 없음) | Webhook URL 없이 페이로드 구조 검증만 가능하도록 설계. `SLACK_WEBHOOK_URL` 환경변수 추가 시 실제 전송으로 교체 가능 |
 | **데이터 보안** | 샘플 transcript는 가상 데이터 | 실제 회의 음성·transcript를 포함하지 않았습니다. 실 배포 시 암호화 저장 및 접근 제어 필요 |
@@ -307,16 +336,16 @@ LLM 응답은 3단계를 거칩니다:
 │
 ├── ingestion/                   # 오디오·JSON 로드, STT, 화자분리
 ├── preprocessing/               # 화자 정규화, 청크 생성, 도메인 용어
-├── extraction/                  # LLM 추출, 검증, fallback
-├── db/                          # SQLite/PostgreSQL 클라이언트
+├── extraction/                  # Gemini LLM 추출, 검증, 재시도
+├── db/                          # PostgreSQL 클라이언트
 ├── analytics/                   # 품질 분석, 키워드, 임베딩
 ├── dashboard/                   # Streamlit 대시보드
 ├── integrations/                # Slack mock 연동
 │
 ├── data/
 │   ├── sample_transcript.json   # 데모용 transcript (커밋됨)
-│   ├── app.db                   # SQLite DB (mock 모드)
-│   └── app_quality.db           # large-v3 + pyannote 기반 고품질 DB
+│   ├── app.db                   # 초기 SQLite PoC 산출물
+│   └── app_quality.db           # SQLite 개발용 샘플 DB
 │
 ├── experiments/                 # DB·STT·Vector DB 비교 실험
 ├── scripts/                     # 임베딩 생성, 시드 데이터 등 유틸
@@ -329,16 +358,15 @@ LLM 응답은 3단계를 거칩니다:
 
 | 변수 | 기본값 | 설명 |
 |---|---|---|
-| `LLM_PROVIDER` | `mock` | `gemini` 또는 `mock` |
+| `LLM_PROVIDER` | `gemini` | 최종 실행은 `gemini` |
 | `GEMINI_API_KEY` | — | Gemini API 키 (실제 추출 시 필수) |
 | `GEMINI_MODEL` | `gemini-2.5-flash-lite` | 사용할 Gemini 모델 |
-| `LLM_FALLBACK` | `mock` | API 실패 시 폴백 프로바이더 |
-| `DB_BACKEND` | `sqlite` | `sqlite` 또는 `postgres` |
-| `DATABASE_URL` | — | PostgreSQL DSN |
-| `DATABASE_PATH` | `data/app.db` | SQLite 파일 경로 |
+| `LLM_FALLBACK` | `mock` | 내부 개발용 fallback 설정 |
+| `DB_BACKEND` | `postgres` | `postgres` 또는 `sqlite` |
+| `DATABASE_URL` | `postgresql://postgres:postgres@localhost:5432/mobidays_app` | PostgreSQL DSN |
+| `DATABASE_PATH` | `data/app_quality.db` | SQLite 개발용 파일 경로 |
 | `VECTOR_DB_PATH` | `data/vector/faiss_action_items` | FAISS 인덱스 경로 |
 | `STT_MODEL` | `large-v3` | `small`, `base`, `large-v3` |
 | `STT_DEVICE` | `cpu` | `cpu` 또는 `cuda` |
 | `STT_COMPUTE_TYPE` | `int8` | `int8`, `float16` |
 | `HUGGINGFACE_TOKEN` | — | pyannote 모델 접근용 (화자분리 시 필수) |
-| `DIARIZATION_NUM_SPEAKERS` | — | 화자 수 고정 (미설정 시 자동 감지) |

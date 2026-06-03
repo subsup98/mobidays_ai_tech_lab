@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
+from datetime import date
 from typing import Protocol
 
 from google import genai
@@ -31,7 +32,9 @@ DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-lite"
 
 
 class Extractor(Protocol):
-    def extract(self, chunk: Chunk, meeting_id: str) -> "ExtractionResult":
+    def extract(
+        self, chunk: Chunk, meeting_id: str, meeting_date: "date | None" = None
+    ) -> "ExtractionResult":
         ...
 
 
@@ -47,7 +50,9 @@ class MockExtractor:
     def __init__(self, model_name: str = "mock-rule-v1") -> None:
         self.model_name = model_name
 
-    def extract(self, chunk: Chunk, meeting_id: str) -> ExtractionResult:
+    def extract(
+        self, chunk: Chunk, meeting_id: str, meeting_date: date | None = None
+    ) -> ExtractionResult:
         run_id = stable_hash("extract", meeting_id, chunk.chunk_id, self.model_name)
         extracted = _mock_extract(chunk)
         action_items = [
@@ -57,6 +62,7 @@ class MockExtractor:
                 sequence_no=index,
                 extracted=item,
                 extraction_run_id=run_id,
+                meeting_date=meeting_date,
             )
             for index, item in enumerate(extracted.action_items, start=1)
         ]
@@ -96,7 +102,9 @@ class GeminiExtractor:
             raise RuntimeError("GEMINI_API_KEY is required for GeminiExtractor")
         self.client = genai.Client(api_key=self.api_key)
 
-    def extract(self, chunk: Chunk, meeting_id: str) -> ExtractionResult:
+    def extract(
+        self, chunk: Chunk, meeting_id: str, meeting_date: date | None = None
+    ) -> ExtractionResult:
         prompt = build_chunk_prompt(chunk)
         run_id = stable_hash("extract", meeting_id, chunk.chunk_id, self.model_name)
         last_error: str | None = None
@@ -134,6 +142,7 @@ class GeminiExtractor:
                         sequence_no=index,
                         extracted=item,
                         extraction_run_id=run_id,
+                        meeting_date=meeting_date,
                     )
                     for index, item in enumerate(payload.action_items, start=1)
                 ]
@@ -188,12 +197,14 @@ class FallbackExtractor:
         self.primary = primary
         self.fallback = fallback
 
-    def extract(self, chunk: Chunk, meeting_id: str) -> ExtractionResult:
-        result = self.primary.extract(chunk, meeting_id)
+    def extract(
+        self, chunk: Chunk, meeting_id: str, meeting_date: date | None = None
+    ) -> ExtractionResult:
+        result = self.primary.extract(chunk, meeting_id, meeting_date)
         if result.run.parsed_ok:
             return result
 
-        fallback_result = self.fallback.extract(chunk, meeting_id)
+        fallback_result = self.fallback.extract(chunk, meeting_id, meeting_date)
         fallback_run = fallback_result.run.model_copy(
             update={
                 "mode": ExtractionMode.FALLBACK,
@@ -204,7 +215,7 @@ class FallbackExtractor:
 
 
 def build_extractor() -> Extractor:
-    provider = os.getenv("LLM_PROVIDER", "mock").lower()
+    provider = os.getenv("LLM_PROVIDER", "gemini").lower()
     fallback_enabled = os.getenv("LLM_FALLBACK", "mock").lower() == "mock"
 
     if provider == "gemini":
@@ -332,8 +343,7 @@ def _select_action_evidence(text: str, fallback_ids: list[str]) -> tuple[str | N
             source_id = None
             if line.startswith("[") and "]" in line:
                 source_id = line[1:line.index("]")]
-            evidence_text = line.split(": ", 1)[-1].strip()
-            return evidence_text, [source_id] if source_id else fallback_ids[:1]
+            return line.strip(), [source_id] if source_id else fallback_ids[:1]
     return None, fallback_ids[:1]
 
 

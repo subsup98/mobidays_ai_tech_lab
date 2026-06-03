@@ -157,8 +157,11 @@ CREATE TABLE IF NOT EXISTS issue_keywords (
     score REAL NOT NULL DEFAULT 0.0,
     frequency INTEGER NOT NULL DEFAULT 0,
     source_action_count INTEGER NOT NULL DEFAULT 0,
+    campaign_context TEXT NOT NULL DEFAULT '(미분류)',
+    advertiser_context TEXT NOT NULL DEFAULT '(미분류)',
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE (meeting_id, keyword, keyword_type),
+    UNIQUE (meeting_id, keyword, keyword_type, campaign_context, advertiser_context),
+    -- 위 UNIQUE는 신규 DB 데이터 무결성용. upsert는 PK(issue_keyword_id)로 충돌 해소.
     FOREIGN KEY (meeting_id) REFERENCES meetings(meeting_id) ON DELETE CASCADE
 );
 

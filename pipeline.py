@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from datetime import date
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -35,7 +36,7 @@ def run_pipeline(
     db_path: str | Path = DEFAULT_DB_PATH,
     input_mode: str = "transcript",
     transcript_output: str | Path = DEFAULT_TRANSCRIPT_OUTPUT,
-    db_backend: str = "sqlite",
+    db_backend: str = "postgres",
     pg_dsn: str | None = None,
     num_speakers: int | None = None,
     title: str | None = None,
@@ -58,13 +59,19 @@ def run_pipeline(
 
     _store_transcript(client, transcript)
     _store_chunks(client, chunks)
-    _extract_and_store(client, transcript.meeting.meeting_id, chunks)
+    _extract_and_store(
+        client, transcript.meeting.meeting_id, chunks, transcript.meeting.meeting_date
+    )
+
+    for warning in check_evidence_integrity(client, transcript.meeting.meeting_id):
+        print(f"[정합성 경고] {warning}")
+
     summarize_and_store(client, transcript.meeting.meeting_id, transcript)
     generate_and_store_embeddings(client, transcript.meeting.meeting_id)
 
 
 def build_db_client(
-    db_backend: str = "sqlite",
+    db_backend: str = "postgres",
     db_path: str | Path = DEFAULT_DB_PATH,
     pg_dsn: str | None = None,
 ) -> object:
@@ -94,6 +101,8 @@ def _build_transcript_from_audio(
         diarization_status = "completed"
         diarization_error = None
     except Exception as exc:
+        if os.getenv("DIARIZATION_REQUIRE_SUCCESS", "0").lower() in {"1", "true", "yes"}:
+            raise
         diarization_result = fallback_single_speaker(0.0, diarization_end)
         diarization_status = "fallback"
         diarization_error = str(exc)
@@ -195,15 +204,22 @@ def _store_chunks(client: SQLiteClient, chunks: list[object]) -> None:
     )
 
 
-def _extract_and_store(client: SQLiteClient, meeting_id: str, chunks: list[object]) -> None:
+def _extract_and_store(
+    client: SQLiteClient,
+    meeting_id: str,
+    chunks: list[object],
+    meeting_date: "date | None" = None,
+) -> None:
     extractor = build_extractor()
+    # 회의 날짜가 없으면 README 가정대로 "회의일=오늘"로 간주해 상대 기한을 환산
+    base_date = meeting_date or date.today()
     extraction_chunks = chunks
-    if os.getenv("LLM_PROVIDER", "mock").lower() == "gemini":
+    if os.getenv("LLM_PROVIDER", "gemini").lower() == "gemini":
         extraction_chunks = [_combine_chunks_for_extraction(meeting_id, chunks)]
         _store_chunks(client, extraction_chunks)
 
     for chunk in extraction_chunks:
-        result = extractor.extract(chunk, meeting_id)
+        result = extractor.extract(chunk, meeting_id, base_date)
         run = result.run
         client.upsert(
             "extraction_runs",
@@ -264,6 +280,58 @@ def _extract_and_store(client: SQLiteClient, meeting_id: str, chunks: list[objec
             )
 
 
+def check_evidence_integrity(client: SQLiteClient, meeting_id: str) -> list[str]:
+    """근거 발화 연결 정합성을 점검한다.
+
+    action_item_sources가 가리키는 utterance_id가 실제 utterances에 모두
+    존재하는지, 또 근거 발화가 하나도 없는 액션이 있는지 확인한다. 문제가
+    있으면 사람이 읽을 수 있는 경고 메시지 리스트를 돌려준다(없으면 빈 리스트).
+
+    저장과 추출이 다른 utterance_id 집합을 쓰게 되면(파이프라인 순서 오류 등)
+    근거 발화 요약이 조용히 빈칸이 되는데, 이를 즉시 드러내기 위한 방어막이다.
+    """
+    warnings: list[str] = []
+
+    orphan = client.fetch_one(
+        """
+        SELECT COUNT(*) AS n
+        FROM action_item_sources s
+        JOIN action_items a ON a.action_item_id = s.action_item_id
+        WHERE a.meeting_id = ?
+          AND NOT EXISTS (
+              SELECT 1 FROM utterances u WHERE u.utterance_id = s.utterance_id
+          )
+        """,
+        (meeting_id,),
+    )
+    orphan_count = int(orphan["n"]) if orphan else 0
+    if orphan_count:
+        warnings.append(
+            f"근거 발화 연결 {orphan_count}건이 실제 발화(utterances)와 매칭되지 않습니다. "
+            "근거 발화 요약이 빈칸으로 표시될 수 있습니다."
+        )
+
+    no_source = client.fetch_one(
+        """
+        SELECT COUNT(*) AS n
+        FROM action_items a
+        WHERE a.meeting_id = ?
+          AND NOT EXISTS (
+              SELECT 1 FROM action_item_sources s
+              WHERE s.action_item_id = a.action_item_id
+          )
+        """,
+        (meeting_id,),
+    )
+    no_source_count = int(no_source["n"]) if no_source else 0
+    if no_source_count:
+        warnings.append(
+            f"근거 발화가 연결되지 않은 액션이 {no_source_count}건 있습니다."
+        )
+
+    return warnings
+
+
 def _combine_chunks_for_extraction(meeting_id: str, chunks: list[object]) -> Chunk:
     utterance_ids = []
     for chunk in chunks:
@@ -296,11 +364,11 @@ def main() -> None:
         choices=["audio", "transcript"],
         default="transcript",
     )
-    parser.add_argument("--db", default=str(DEFAULT_DB_PATH), help="SQLite DB path")
+    parser.add_argument("--db", default=str(DEFAULT_DB_PATH), help="SQLite PoC DB path")
     parser.add_argument(
         "--db-backend",
         choices=["sqlite", "postgres"],
-        default=os.getenv("DB_BACKEND", "sqlite"),
+        default=os.getenv("DB_BACKEND", "postgres"),
         help="Operational DB backend",
     )
     parser.add_argument(
@@ -340,7 +408,8 @@ def main() -> None:
         json.dumps(
             {
                 "status": "ok",
-                "db": args.db,
+                "db_backend": args.db_backend,
+                "db": args.pg_dsn if args.db_backend == "postgres" else args.db,
                 "input": args.input,
                 "input_mode": args.input_mode,
             },

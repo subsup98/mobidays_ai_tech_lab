@@ -38,8 +38,8 @@ from integrations.slack_mock import generate_and_store_payloads
 from models import stable_hash
 
 
-DEFAULT_DB_BACKEND = os.getenv("DB_BACKEND", "sqlite")
-DEFAULT_DB = os.getenv("DATABASE_PATH", "data/app.db")
+DEFAULT_DB_BACKEND = os.getenv("DB_BACKEND", "postgres")
+DEFAULT_DB = os.getenv("DATABASE_PATH", "data/app_quality.db")
 DEFAULT_DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("PGDSN") or DEFAULT_DSN
 
 
@@ -50,7 +50,8 @@ COLUMN_LABELS = {
     "action_item_id": "액션 ID",
     "action_no": "액션 아이템",
     "assignee": "담당자",
-    "assignee_normalized": "담당 역할",
+    "assignee_normalized": "담당 역할 코드",
+    "assignee_display": "담당 역할",
     "category": "분류",
     "priority": "우선순위",
     "status": "상태",
@@ -112,6 +113,22 @@ RISK_FLAG_LABELS = {
 }
 
 
+KEYWORD_TYPE_LABELS = {
+    "domain": "도메인 용어",
+    "bigram": "연관어",
+    "risk_flag": "위험 신호",
+}
+
+
+ASSIGNEE_LABELS = {
+    "team_lead": "팀장",
+    "performance_marketer": "퍼포먼스 마케터",
+    "content_designer": "콘텐츠 디자이너",
+    "speaker_from_context": "발화자 추론 필요",
+    "unassigned": "담당자 미배정",
+}
+
+
 @st.cache_resource
 def get_client(db_backend: str, db_path: str, database_url: str) -> object:
     if db_backend == "postgres":
@@ -138,6 +155,21 @@ def display_dataframe(df: pd.DataFrame, **kwargs: object) -> None:
     )
 
 
+def _with_assignee_display(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or "assignee_normalized" not in df.columns:
+        return df
+    enriched = df.copy()
+    enriched["assignee_display"] = enriched["assignee_normalized"].apply(_assignee_label)
+    return enriched
+
+
+def _assignee_label(value: object) -> str:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return "담당자 미배정"
+    return ASSIGNEE_LABELS.get(normalized, normalized)
+
+
 def main() -> None:
     st.title("모비데이즈 회의 액션 대시보드")
     db_backend = st.sidebar.selectbox(
@@ -145,8 +177,10 @@ def main() -> None:
         ["postgres", "sqlite"],
         index=0 if DEFAULT_DB_BACKEND == "postgres" else 1,
     )
-    db_path = st.sidebar.text_input("SQLite DB 경로", DEFAULT_DB)
     database_url = st.sidebar.text_input("PostgreSQL DSN", DEFAULT_DATABASE_URL)
+    db_path = DEFAULT_DB
+    if db_backend == "sqlite":
+        db_path = st.sidebar.text_input("SQLite DB 경로", DEFAULT_DB)
     st.sidebar.caption(f"Vector DB: {vector_db_path()}")
     client = get_client(db_backend, db_path, database_url)
 
@@ -160,11 +194,13 @@ def main() -> None:
     meeting_df = as_dataframe(meetings)
 
     tabs = st.tabs(
-        ["전체 현황", "액션 운영", "품질 점검", "STT 검토", "유사도 검색", "회의 업로드"]
+        ["전체 현황", "액션 운영", "품질 점검", "STT 검토", "유사도 검색", "회의 업로드", "가이드"]
     )
 
     with tabs[5]:
         render_upload(db_backend, db_path, database_url)
+    with tabs[6]:
+        render_guide()
 
     if meeting_df.empty:
         for tab in tabs[:5]:
@@ -255,7 +291,7 @@ def render_overview(client: object, meeting_id: str) -> None:
         )
 
     # ── 이 회의 상태별 현황 ──────────────────────────────────────────
-    action_df = as_dataframe(actions)
+    action_df = _with_assignee_display(as_dataframe(actions))
     if not action_df.empty:
         st.subheader("이 회의 상태별 현황")
         _status_ko = {
@@ -286,11 +322,11 @@ def render_overview(client: object, meeting_id: str) -> None:
             width="stretch",
         )
 
-        # ── 위젯 2: 담당자별 미완료 Top N ───────────────────────────
-        st.subheader("담당자별 미완료 액션 Top N")
+        # ── 위젯 2: 담당 역할별 미완료 Top N ────────────────────────
+        st.subheader("담당 역할별 미완료 액션 Top N")
         assignee_backlog = (
             action_df[action_df["status"] != "done"]
-            .groupby("assignee_normalized")
+            .groupby("assignee_display")
             .size()
             .reset_index(name="open_count")
             .sort_values("open_count", ascending=False)
@@ -301,9 +337,9 @@ def render_overview(client: object, meeting_id: str) -> None:
             st.altair_chart(
                 alt.Chart(assignee_backlog).mark_bar().encode(
                     x=alt.X("open_count:Q", title="미완료 건수", scale=alt.Scale(domainMin=0), axis=alt.Axis(tickMinStep=1, format="d")),
-                    y=alt.Y("assignee_normalized:N", title="담당자", sort="-x"),
+                    y=alt.Y("assignee_display:N", title="담당 역할", sort="-x"),
                     color=alt.value("#F5A623"),
-                    tooltip=["assignee_normalized", "open_count"],
+                    tooltip=["assignee_display", "open_count"],
                 ).properties(width="container", height=max(120, len(assignee_backlog) * 40)),
                 width="stretch",
             )
@@ -314,51 +350,41 @@ def render_overview(client: object, meeting_id: str) -> None:
         regenerate_issue_keywords(client, meeting_id)
         st.rerun()
 
-    campaign_rows = client.fetch_all(
-        """
-        SELECT DISTINCT
-            COALESCE(campaign_context, '(미분류)') AS campaign,
-            COALESCE(advertiser_context, '(미분류)') AS advertiser
-        FROM action_items
-        WHERE meeting_id = ?
-        ORDER BY campaign
-        """,
-        (meeting_id,),
-    )
-    campaigns = ["전체"] + sorted({r["campaign"] for r in campaign_rows if r["campaign"] != "(미분류)"})
-    advertisers = ["전체"] + sorted({r["advertiser"] for r in campaign_rows if r["advertiser"] != "(미분류)"})
-
-    filter_col1, filter_col2 = st.columns(2)
-    sel_campaign = filter_col1.selectbox("캠페인 필터", campaigns, key="kw_campaign")
-    sel_advertiser = filter_col2.selectbox("광고주 필터", advertisers, key="kw_advertiser")
-
     kw_rows = client.fetch_all(
         """
         SELECT
-            ik.keyword,
-            ik.keyword_type,
-            ik.score,
-            ik.frequency,
-            ik.source_action_count,
-            COALESCE(a.campaign_context, '(미분류)') AS campaign,
-            COALESCE(a.advertiser_context, '(미분류)') AS advertiser
-        FROM issue_keywords ik
-        LEFT JOIN action_items a ON a.meeting_id = ik.meeting_id
-        WHERE ik.meeting_id = ?
-        GROUP BY ik.keyword, ik.keyword_type, ik.score, ik.frequency,
-                 ik.source_action_count, campaign, advertiser
-        ORDER BY ik.score DESC
+            keyword,
+            keyword_type,
+            score,
+            frequency,
+            source_action_count,
+            campaign_context AS campaign,
+            advertiser_context AS advertiser
+        FROM issue_keywords
+        WHERE meeting_id = ?
+        ORDER BY score DESC
         """,
         (meeting_id,),
     )
     kw_df = as_dataframe(kw_rows)
     if not kw_df.empty:
+        campaigns = ["전체"] + sorted({c for c in kw_df["campaign"].unique() if c != "(미분류)"})
+        advertisers = ["전체"] + sorted({a for a in kw_df["advertiser"].unique() if a != "(미분류)"})
+        filter_col1, filter_col2 = st.columns(2)
+        sel_campaign = filter_col1.selectbox("캠페인 필터", campaigns, key="kw_campaign")
+        sel_advertiser = filter_col2.selectbox("광고주 필터", advertisers, key="kw_advertiser")
+
         if sel_campaign != "전체":
             kw_df = kw_df[kw_df["campaign"] == sel_campaign]
         if sel_advertiser != "전체":
             kw_df = kw_df[kw_df["advertiser"] == sel_advertiser]
-        kw_df = kw_df.drop_duplicates(subset=["keyword", "keyword_type"]).head(20)
-        display_dataframe(kw_df[["keyword", "keyword_type", "score", "frequency", "source_action_count", "campaign", "advertiser"]])
+        kw_df = kw_df.head(20)
+        kw_df["keyword_type"] = kw_df["keyword_type"].map(
+            lambda value: KEYWORD_TYPE_LABELS.get(value, value)
+        )
+        display_dataframe(
+            kw_df[["keyword", "keyword_type", "frequency", "source_action_count", "campaign", "advertiser"]]
+        )
     else:
         st.info("키워드가 없습니다. 이슈 키워드 재생성 버튼을 눌러주세요.")
 
@@ -375,7 +401,7 @@ def render_action_ops(client: object, meeting_id: str) -> None:
     st.subheader("액션 상세")
     visible_columns = [
         "action_no",
-        "assignee_normalized",
+        "assignee_display",
         "category",
         "priority",
         "status",
@@ -402,7 +428,7 @@ def render_action_ops(client: object, meeting_id: str) -> None:
     with detail_left:
         st.markdown("**선택한 액션**")
         st.write(f"액션 아이템: {selected_row['action_no']}")
-        st.write(f"담당 역할: {selected_row['assignee_normalized']}")
+        st.write(f"담당 역할: {selected_row['assignee_display']}")
         st.write(f"분류: {selected_row['category']}")
         st.write(f"우선순위: {selected_row['priority']}")
         st.write(f"우선순위 근거: {_priority_reason(selected_row)}")
@@ -511,20 +537,6 @@ def render_quality(client: object, meeting_id: str) -> None:
     else:
         st.success("담당자, 기한, 근거 발화 기준에서 감지된 위험 신호가 없습니다.")
 
-    if not action_df.empty:
-        st.subheader("신뢰도 분포")
-        chart_df = action_df[["llm_confidence", "validation_score", "review_required"]].copy()
-        chart_df["검토 필요"] = chart_df["review_required"].map({0: "아니오", 1: "예"}).fillna("아니오")
-        st.altair_chart(
-            alt.Chart(chart_df).mark_circle(size=80).encode(
-                x=alt.X("llm_confidence", title="LLM 신뢰도", scale=alt.Scale(domain=[0, 1])),
-                y=alt.Y("validation_score", title="검증 점수", scale=alt.Scale(domain=[0, 1])),
-                color=alt.Color("검토 필요", scale=alt.Scale(domain=["아니오", "예"], range=["#4C8BF5", "#E8433A"])),
-                tooltip=["llm_confidence", "validation_score", "검토 필요"],
-            ).properties(width="container", height=320),
-            width="stretch",
-        )
-
     low_items = low_confidence_items(client, meeting_id)
     mismatches = validation_mismatches(client, meeting_id)
 
@@ -536,7 +548,7 @@ def render_quality(client: object, meeting_id: str) -> None:
             st.info("최종 신뢰도 0.7 미만 항목은 없습니다.")
         else:
             display_dataframe(_quality_table(low_df))
-    right.subheader("LLM은 높지만 검증은 낮음")
+    right.subheader("신뢰도-검증 불일치")
     with right:
         mismatch_df = _with_action_numbers(as_dataframe(mismatches))
         if mismatch_df.empty:
@@ -552,7 +564,7 @@ def render_quality(client: object, meeting_id: str) -> None:
             flagged_df[
                 [
                     "action_no",
-                    "assignee_normalized",
+                    "assignee_display",
                     "display_description",
                     "llm_confidence",
                     "validation_score",
@@ -665,11 +677,12 @@ def render_similar_decisions(client: object, meeting_id: str) -> None:
         scope_meeting_id = meeting_id if search_scope == "현재 회의" else None
         results = search_similar(client, query.strip(), top_k=5, meeting_id=scope_meeting_id)
         if results:
+            result_df = _with_assignee_display(as_dataframe(results))
             display_dataframe(
-                as_dataframe(results)[
+                result_df[
                     [
                         "description",
-                        "assignee_normalized",
+                        "assignee_display",
                         "category",
                         "priority",
                         "status",
@@ -682,6 +695,108 @@ def render_similar_decisions(client: object, meeting_id: str) -> None:
             )
         else:
             st.info("Vector DB에 저장된 임베딩이 없습니다. 먼저 임베딩을 생성하세요.")
+
+
+def render_guide() -> None:
+    st.subheader("로컬 실행 가이드")
+    st.caption("한 줄 실행 스크립트가 환경설정까지 처리하며, 기본 데모와 STT 음성 입력 모드를 분리했습니다.")
+
+    quick_tab, real_tab, key_tab, video_tab = st.tabs(
+        ["기본 데모", "STT 음성 입력", "키 준비", "녹화본"]
+    )
+
+    with quick_tab:
+        st.markdown("**용도**")
+        st.write("제출 확인용 기본 경로입니다. STT와 화자분리를 생략하고 샘플 transcript로 추출, DB 저장, 대시보드를 확인합니다.")
+
+        st.markdown("**1. 한 줄 실행**")
+        st.code(
+            ".\\run.ps1",
+            language="powershell",
+        )
+
+        st.caption("최초 실행 시 `.venv` 생성, `requirements.txt` 설치, `.env.example` 복사까지 자동으로 수행합니다.")
+
+        st.markdown("**2. 입력과 의존성**")
+        st.write("기본 입력은 `data/sample_transcript.json`입니다. 이 모드는 `requirements-stt.txt`를 설치하지 않습니다.")
+
+        st.markdown("**3. 선택 설정**")
+        st.code(
+            """GEMINI_API_KEY=your_gemini_api_key
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/mobidays_app""",
+            language="dotenv",
+        )
+        st.caption("Gemini API 키가 없으면 mock extractor fallback으로 로컬 데모를 확인할 수 있습니다. PostgreSQL 연결이 안 되면 SQLite로 자동 전환됩니다.")
+
+    with real_tab:
+        st.markdown("**용도**")
+        st.write("mp3, wav, m4a, flac 파일을 입력해 STT, 화자분리, 추출, DB 저장, 대시보드까지 확인합니다.")
+
+        st.markdown("**1. 음성 파일 실행**")
+        st.code(
+            ".\\run.ps1 -InputMode audio -InputPath \"C:\\path\\meeting.mp3\"",
+            language="powershell",
+        )
+        st.caption("오디오 모드에서는 `requirements.txt`와 `requirements-stt.txt`가 자동 설치됩니다.")
+
+        st.markdown("**2. 필요한 키**")
+        st.code(
+            """GEMINI_API_KEY=your_gemini_api_key
+HUGGINGFACE_TOKEN=your_huggingface_token
+DIARIZATION_MODEL=pyannote/speaker-diarization-3.1
+DIARIZATION_REQUIRE_SUCCESS=0""",
+            language="dotenv",
+        )
+
+        st.markdown("**3. 회의 인원 수를 알고 있을 때**")
+        st.code(
+            ".\\run.ps1 -InputMode audio -InputPath \"C:\\path\\meeting.mp3\" -NumSpeakers 3",
+            language="powershell",
+        )
+
+    with key_tab:
+        st.markdown("**API 키와 모델 접근 준비**")
+        guide_rows = [
+            {
+                "항목": "Gemini API 키",
+                "링크": "https://aistudio.google.com/app/apikey",
+                "설정값": "GEMINI_API_KEY",
+                "메모": "Google 계정 로그인 후 API key 생성",
+            },
+            {
+                "항목": "HuggingFace 토큰",
+                "링크": "https://huggingface.co/settings/tokens",
+                "설정값": "HUGGINGFACE_TOKEN",
+                "메모": "Read 권한 토큰 생성",
+            },
+            {
+                "항목": "pyannote 모델 약관",
+                "링크": "https://huggingface.co/pyannote/speaker-diarization-3.1",
+                "설정값": "DIARIZATION_MODEL",
+                "메모": "speaker-diarization-3.1 및 segmentation-3.0 접근 조건 동의",
+            },
+        ]
+        st.dataframe(pd.DataFrame(guide_rows), width="stretch", hide_index=True)
+
+    with video_tab:
+        default_video_path = Path("data/guide/모비데이즈.mkv")
+        if default_video_path.exists():
+            st.video(str(default_video_path))
+
+        video_url = st.text_input(
+            "영상 링크",
+            placeholder="예: Loom 링크, unlisted YouTube URL",
+        )
+        if video_url.strip():
+            st.video(video_url.strip())
+
+        uploaded_video = st.file_uploader(
+            "녹화 영상 업로드",
+            type=["mp4", "mov", "webm", "m4v", "mkv"],
+            help="로컬에서 실행 과정을 녹화한 파일을 올리면 이 탭에서 바로 재생됩니다.",
+        )
+        if uploaded_video is not None:
+            st.video(uploaded_video)
 
 
 def build_action_summary_df(client: object, meeting_id: str) -> pd.DataFrame:
@@ -724,7 +839,7 @@ def build_action_summary_df(client: object, meeting_id: str) -> pd.DataFrame:
     return df[
         [
             "action_no",
-            "assignee_normalized",
+            "assignee_display",
             "display_description",
             "category",
             "priority",
@@ -733,7 +848,7 @@ def build_action_summary_df(client: object, meeting_id: str) -> pd.DataFrame:
             "final_confidence",
             "evidence_summary",
         ]
-]
+    ]
 
 
 def _add_display_descriptions(
@@ -796,7 +911,7 @@ def _attach_display_description_from_evidence(df: pd.DataFrame) -> pd.DataFrame:
         return df
     enriched = df.copy()
     enriched["display_description"] = enriched.apply(_display_description, axis=1)
-    return enriched
+    return _with_assignee_display(enriched)
 
 
 def _display_description(row: pd.Series) -> str:
@@ -888,7 +1003,7 @@ def _build_review_reason_df(action_df: pd.DataFrame) -> pd.DataFrame:
 
     df["risk_flags"] = df["risk_flags_json"].apply(_parse_risk_flags)
     df["review_reason"] = df.apply(_review_reason, axis=1)
-    return df
+    return _with_assignee_display(df)
 
 
 def _build_risk_flag_summary_df(review_df: pd.DataFrame) -> pd.DataFrame:
@@ -911,10 +1026,10 @@ def _build_risk_flag_summary_df(review_df: pd.DataFrame) -> pd.DataFrame:
 def _quality_table(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
-    review_df = _build_review_reason_df(df)
+    review_df = _attach_display_description_from_evidence(_build_review_reason_df(df))
     columns = [
         "action_no",
-        "assignee_normalized",
+        "assignee_display",
         "display_description",
         "llm_confidence",
         "validation_score",
@@ -1000,7 +1115,8 @@ def _meeting_label(meeting_df: pd.DataFrame, meeting_id: str) -> str:
 def _action_label(action_df: pd.DataFrame, action_item_id: str) -> str:
     row = action_df[action_df["action_item_id"] == action_item_id].iloc[0]
     prefix = f"액션 아이템 {row['action_no']} " if "action_no" in row else ""
-    return f"{prefix}{row['assignee_normalized']} - {row['description']}"
+    assignee = row.get("assignee_display") or _assignee_label(row.get("assignee_normalized"))
+    return f"{prefix}{assignee} - {row['description']}"
 
 
 def _render_meeting_summary(client: object, meeting_id: str) -> None:
@@ -1045,8 +1161,6 @@ def _render_meeting_summary(client: object, meeting_id: str) -> None:
         st.markdown("**전체 요약**")
         st.write(summary_text)
 
-    provider = row.get("provider", "mock")
-    st.caption(f"생성 방식: {'Gemini AI' if provider == 'gemini' else 'Mock (Gemini API 키 설정 시 AI 요약 가능)'}")
 
 
 def render_upload(db_backend: str, db_path: str, database_url: str) -> None:
@@ -1054,7 +1168,7 @@ def render_upload(db_backend: str, db_path: str, database_url: str) -> None:
 
     uploaded_file = st.file_uploader(
         "파일 선택",
-        type=["mp3", "wav", "m4a", "flac", "mp4"],
+        type=["mp3", "wav", "m4a", "flac", "mp4", "mkv"],
         help="MP4는 Zoom·Teams 화면 녹화 등 영상 파일도 가능합니다. 오디오 트랙을 자동 추출합니다.",
     )
 
@@ -1064,20 +1178,22 @@ def render_upload(db_backend: str, db_path: str, database_url: str) -> None:
         help="대시보드와 DB에 저장될 회의 이름입니다.",
     )
     num_speakers = st.number_input(
-        "참여 인원 (명)",
+        "회의 참여 인원 수",
         min_value=1,
         max_value=20,
-        value=2,
+        value=None,
         step=1,
-        help="화자분리 정확도를 높이기 위한 힌트입니다. 모르면 2명으로 설정하세요.",
+        placeholder="예: 3",
+        help="비워두면 모델이 화자 수를 자동 판단합니다.",
     )
+    st.caption("비워두면 모델이 화자 수를 자동 판단합니다.")
 
     run_disabled = uploaded_file is None or not title.strip()
     if st.button("처리 시작", disabled=run_disabled, type="primary"):
         _run_upload_pipeline(
             uploaded_file=uploaded_file,
             title=title.strip(),
-            num_speakers=int(num_speakers),
+            num_speakers=int(num_speakers) if num_speakers is not None else None,
             db_backend=db_backend,
             db_path=db_path,
             database_url=database_url,
@@ -1087,7 +1203,7 @@ def render_upload(db_backend: str, db_path: str, database_url: str) -> None:
 def _run_upload_pipeline(
     uploaded_file: object,
     title: str,
-    num_speakers: int,
+    num_speakers: int | None,
     db_backend: str,
     db_path: str,
     database_url: str,
@@ -1098,7 +1214,13 @@ def _run_upload_pipeline(
     from ingestion.stt import FasterWhisperSTT
     from ingestion.transcript_builder import build_transcript, save_transcript_json
     from models import stable_hash, utc_now_iso
-    from pipeline import _extract_and_store, _store_chunks, _store_transcript, build_db_client
+    from pipeline import (
+        _extract_and_store,
+        _store_chunks,
+        _store_transcript,
+        build_db_client,
+        check_evidence_integrity,
+    )
     from preprocessing.chunker import build_chunks
     from preprocessing.normalizer import normalize_speakers, remove_consecutive_duplicates
 
@@ -1111,7 +1233,7 @@ def _run_upload_pipeline(
     save_path.write_bytes(uploaded_file.getbuffer())
 
     audio_path = save_path
-    if suffix == ".mp4":
+    if suffix in {".mp4", ".mkv"}:
         with st.spinner("MP4에서 오디오 추출 중 ..."):
             wav_path = save_path.with_suffix(".wav")
             ok, err = _convert_mp4_to_wav(save_path, wav_path)
@@ -1137,15 +1259,14 @@ def _run_upload_pipeline(
         st.success(f"음성 인식 완료 — 발화 {len(stt_result.segments)}개")
 
         # ── 2단계: 화자 분리 ─────────────────────────────────────────
-        with st.spinner(f"화자 분리 중 ({num_speakers}명 힌트) ..."):
+        speaker_hint_text = f"{num_speakers}명 힌트" if num_speakers else "자동 판단"
+        with st.spinner(f"화자 분리 중 ({speaker_hint_text}) ..."):
             diarization_end = max(
                 (s.end_sec for s in stt_result.segments),
                 default=audio_metadata.duration_sec or 0.0,
             )
             try:
-                diarization_result = PyannoteDiarizer(num_speakers=num_speakers).diarize(
-                    audio_metadata.audio_path
-                )
+                diarization_result = PyannoteDiarizer(num_speakers=num_speakers).diarize(audio_metadata.audio_path)
                 diarization_status = "completed"
                 diarization_error = None
             except Exception as exc:
@@ -1159,6 +1280,11 @@ def _run_upload_pipeline(
             transcript = build_transcript(audio_metadata, stt_result, diarization_result)
             saved_path = save_transcript_json(transcript, transcript_output)
             transcript.meeting.transcript_path = str(saved_path)
+
+            # 정규화·중복 제거를 먼저 적용한 뒤 저장·청킹해야
+            # utterances와 chunk/추출이 같은 utterance_id를 공유한다.
+            # (CLI 파이프라인 run_pipeline과 동일한 순서)
+            transcript = remove_consecutive_duplicates(normalize_speakers(transcript))
 
             _store_transcript(client, transcript)
             client.upsert(
@@ -1185,7 +1311,6 @@ def _run_upload_pipeline(
                 ],
             )
 
-            transcript = remove_consecutive_duplicates(normalize_speakers(transcript))
             chunks = build_chunks(transcript)
             _store_chunks(client, chunks)
 
@@ -1193,6 +1318,10 @@ def _run_upload_pipeline(
         with st.spinner("액션 추출 중 (LLM) ..."):
             _extract_and_store(client, transcript.meeting.meeting_id, chunks)
         st.success("액션 추출 완료")
+
+        # 근거 발화 연결 정합성 점검 (저장/추출 utterance_id 불일치 방어막)
+        for warning in check_evidence_integrity(client, transcript.meeting.meeting_id):
+            st.warning(f"정합성 경고: {warning}")
 
         # ── 5단계: 회의록 요약 ───────────────────────────────────────
         with st.spinner("회의록 요약 생성 중 ..."):

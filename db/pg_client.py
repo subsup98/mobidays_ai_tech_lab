@@ -161,8 +161,10 @@ CREATE TABLE IF NOT EXISTS issue_keywords (
     score DOUBLE PRECISION NOT NULL DEFAULT 0.0,
     frequency INTEGER NOT NULL DEFAULT 0,
     source_action_count INTEGER NOT NULL DEFAULT 0,
+    campaign_context VARCHAR NOT NULL DEFAULT '(미분류)',
+    advertiser_context VARCHAR NOT NULL DEFAULT '(미분류)',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (meeting_id, keyword, keyword_type)
+    UNIQUE (meeting_id, keyword, keyword_type, campaign_context, advertiser_context)
 );
 
 CREATE TABLE IF NOT EXISTS action_item_events (
@@ -217,9 +219,13 @@ CREATE INDEX IF NOT EXISTS idx_issue_keywords_meeting_score ON issue_keywords(me
 CREATE INDEX IF NOT EXISTS idx_action_item_events_action ON action_item_events(action_item_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_slack_payloads_action ON slack_payloads(action_item_id);
 CREATE INDEX IF NOT EXISTS idx_embeddings_model ON action_item_embeddings(model_name);
+
+-- 기존 DB 마이그레이션: issue_keywords에 캠페인/광고주 맥락 추가
+ALTER TABLE issue_keywords ADD COLUMN IF NOT EXISTS campaign_context VARCHAR NOT NULL DEFAULT '(미분류)';
+ALTER TABLE issue_keywords ADD COLUMN IF NOT EXISTS advertiser_context VARCHAR NOT NULL DEFAULT '(미분류)';
 """
 
-DEFAULT_DSN = "postgresql://postgres:postgres@localhost:5432/mobidays_bench"
+DEFAULT_DSN = "postgresql://postgres:postgres@localhost:5432/mobidays_app"
 
 
 class PostgreSQLClient(BaseDBClient):

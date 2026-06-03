@@ -160,8 +160,10 @@ CREATE TABLE IF NOT EXISTS issue_keywords (
     score DOUBLE NOT NULL DEFAULT 0.0,
     frequency INTEGER NOT NULL DEFAULT 0,
     source_action_count INTEGER NOT NULL DEFAULT 0,
+    campaign_context VARCHAR NOT NULL DEFAULT '(미분류)',
+    advertiser_context VARCHAR NOT NULL DEFAULT '(미분류)',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (meeting_id, keyword, keyword_type)
+    UNIQUE (meeting_id, keyword, keyword_type, campaign_context, advertiser_context)
 );
 
 CREATE TABLE IF NOT EXISTS action_item_events (

@@ -1,49 +1,73 @@
-# AI Usage
+# AI 도구 활용 내역
 
-## Tools Used
+## 사용한 AI 도구
 
-- ChatGPT/Codex was used for architecture discussion, implementation planning, code generation, and review.
-- The generated code and design decisions were manually reviewed and adjusted during implementation.
+본 프로젝트에서는 Claude Code와 Codex를 함께 활용했습니다.
 
-## Major AI-Assisted Decisions
+두 코딩 에이전트는 아키텍처 논의, 기술 스택 검토, 구현 계획 수립, 코드 작성, 리팩터링, 실험 결과 정리, 대시보드 개선 과정에서 보조 도구로 사용했습니다.
 
-- Selected SQLite over DuckDB for local reproducibility, status updates, and simple submission execution.
-- Selected Streamlit for the local dashboard.
-- Selected Gemini Free Tier as the real LLM path, with mock fallback for reproducibility.
-- Decided to process mp3 directly through STT and diarization while keeping transcript JSON as the canonical intermediate format.
-- Split `action_item_id` and `dedup_key` responsibilities.
-- Split `llm_confidence` and `validation_score`.
-- Generated issue keywords after extraction instead of asking the LLM to tag everything.
+AI가 생성한 코드와 설계 제안은 그대로 반영하지 않고, 과제 요구사항과 실제 실행 결과를 기준으로 직접 검토하고 수정했습니다.
 
-## Manual Review and Corrections
+## 프롬프트 및 프로젝트 관리 방식
 
-- Corrected the DB choice from an earlier DuckDB suggestion to SQLite.
-- Refined `dedup_key` to avoid both duplicate drift and over-merge risk:
-  `meeting_id + assignee_normalized + category + due_date + normalized_task_signature`.
-- Pinned STT dependencies after import testing:
-  `numpy<2`, `torch==2.3.1`, `torchaudio==2.3.1`.
-- Checked Community-1 as an alternate diarization model, then kept pyannote 3.1 as the default because Community-1 requires a newer pyannote stack that is less stable for this Windows PoC.
-- Kept real LLM usage optional and preserved mock fallback.
-- Added submission planning and module-level checklists/worklogs for traceability.
+프로젝트 진행 중 각 모듈별로 `agent.md`를 작성하여 AI 코딩 에이전트에게 작업 기준, 제약사항, 구현 방향을 제공했습니다.
 
-## Prompting Context
+또한 `worklog.md`와 `checklist.md`를 지속적으로 갱신하여 프로젝트의 진행 방향, 완료된 작업, 남은 작업을 추적했습니다. 이를 통해 AI가 단발성 코드 생성에 그치지 않고, 프로젝트의 전체 맥락과 현재 우선순위를 유지한 상태에서 작업하도록 관리했습니다.
 
-AI was given the project requirements, evaluation criteria, confirmed API-use permission, and the final architecture constraints.
+AI에게 제공한 주요 컨텍스트는 다음과 같습니다.
 
-Important constraints included:
+- 직접 STT 처리 경로
+- 화자분리
+- Gemini Free Tier 사용
+- mock fallback을 통한 재현성 확보
+- PostgreSQL 기반 과제 실행 및 운영 DB 구성
+- SQLite 기반 초기 PoC 및 로컬 검증
+- Streamlit 대시보드
+- 구조화된 액션아이템 추출
+- 근거 발화 연결
+- LLM 신뢰도와 규칙 기반 검증 점수 분리
+- 마케팅 운영자가 사용할 수 있는 대시보드 구성
 
-- direct STT path
-- speaker diarization
-- Gemini Free Tier
-- SQLite
-- Streamlit
-- structured extraction
-- evidence utterance references
-- confidence and validation separation
-- dashboard for marketing operations
+## AI 결과물의 검토 및 직접 수정한 판단 사례
 
-## Rejected or Changed AI Output
+AI가 생성하거나 제안한 결과물은 그대로 사용하지 않고, 실제 실행 결과와 과제 요구사항에 맞게 직접 검토하고 수정했습니다.
 
-- A pure DuckDB design was rejected because the PoC needs local operational updates more than OLAP performance.
-- A `dedup_key` based directly on raw/canonical description was changed to a normalized task signature.
-- Low confidence retry was changed to review flagging, because ambiguous meeting content should not be retried into hallucinated certainty.
+특히 주요 기술 선택과 화면 구성은 AI의 제안을 참고하되, 직접 실험 결과, 예상 운영 환경, 비용, 실행 시간, 정확도, 재현성을 기준으로 최종 판단했습니다.
+
+대표적인 사례는 다음과 같습니다.
+
+- 데이터베이스는 최종 과제 실행 및 운영 DB 후보로 PostgreSQL을 사용했습니다. 예상 사용자가 200명 미만이고, 여러 팀이 매주 또는 매일 회의 데이터를 업로드하는 형태라고 판단했기 때문에, 회의, 발화, 액션아이템, 상태 변경 이력을 안정적으로 관리할 수 있는 관계형 DB가 적합하다고 보았습니다.
+- SQLite는 초기 PoC, 로컬 검증, 빠른 재현 테스트 용도로 활용했습니다. 별도 서버 설정 없이 파이프라인과 대시보드 흐름을 빠르게 확인하기에는 유리했지만, 최종 제출 실행 기준은 PostgreSQL로 맞췄습니다.
+- 초기 DuckDB 중심 설계는 수정했습니다. 본 프로젝트는 OLAP 성능보다 액션아이템 상태 변경, 이벤트 이력 저장, 운영 대시보드 연동이 중요하다고 판단했기 때문에 PostgreSQL 중심 구조가 더 적합하다고 보았습니다.
+- 로컬 대시보드 구현에는 Streamlit을 선택했습니다. Python 기반 파이프라인과 바로 연동할 수 있고, 과제 제출 환경에서 빠르게 실행 결과를 확인할 수 있기 때문입니다.
+- 실제 LLM 경로로는 Gemini Free Tier를 사용하고, API 키가 없거나 호출이 실패해도 실행 가능한 mock fallback을 유지했습니다. 과제 리뷰어가 별도 키 없이도 프로젝트 흐름을 확인할 수 있도록 하기 위한 결정입니다.
+- mp3 음성 파일을 직접 STT와 화자분리 단계에 입력하되, 중간 산출물은 transcript JSON을 표준 포맷으로 유지했습니다. 이를 통해 음성 입력과 텍스트 입력 모두 같은 액션아이템 추출 파이프라인을 사용할 수 있게 했습니다.
+- STT 및 화자분리 영역에서는 사용자가 회의 참여 인원 수를 입력하거나 힌트로 제공할 수 있게 하여 화자분리 모델의 정확도를 높이는 방향을 선택했습니다. 실제 회의에서는 참석자 수가 대략 알려져 있는 경우가 많기 때문에, 이를 모델 입력 조건으로 활용하면 불필요한 화자 분할이나 병합 오류를 줄일 수 있다고 판단했습니다.
+- pyannote Community-1 모델도 대안으로 검토했지만, Community-1은 더 최신 pyannote 스택을 요구해 Windows PoC 환경에서 안정성이 낮다고 판단했습니다. 따라서 기본 화자분리 모델은 pyannote 3.1 중심으로 유지했습니다.
+- 과거 회의의 유사한 결정사항이나 액션아이템을 검색하기 위해 Vector DB를 활용했습니다. 액션아이템과 회의 내용을 임베딩으로 저장하고, 의미 기반 유사도 검색을 지원하도록 구성했습니다.
+- 액션아이템을 안정적으로 저장하기 위해 식별 ID와 중복 제거 기준을 분리했습니다. `action_item_id`는 액션이 어느 회의와 청크에서 추출됐는지 추적하기 위한 ID로 사용했고, `dedup_key`는 LLM이 같은 작업을 비슷한 문장으로 여러 번 추출하는 경우를 줄이기 위한 중복 제거 기준으로 사용했습니다.
+- LLM이 같은 작업을 서로 다른 문장으로 표현할 수 있기 때문에, 원문 설명을 그대로 중복 판단 기준으로 사용하지 않았습니다. 대신 작업 내용을 정규화한 `normalized_task_signature`를 사용해 유사한 작업은 묶고, 서로 다른 작업이 잘못 합쳐지는 위험은 줄이도록 수정했습니다.
+- LLM의 자체 신뢰도와 시스템 검증 점수를 분리했습니다. LLM이 높은 신뢰도를 주더라도 담당자, 기한, 근거 발화 등이 부족하면 실제 운영에서는 검토가 필요하므로, 최종 신뢰도는 두 점수 중 낮은 값을 사용하도록 설계했습니다.
+- 낮은 신뢰도 항목을 다시 LLM에 재시도하는 방식은 사용하지 않았습니다. 회의 내용이 애매한 경우 재시도를 통해 확신 있는 환각이 생성될 수 있다고 판단했기 때문에, `review_required=true`로 저장하고 운영자가 확인하도록 설계했습니다.
+- LLM에게 모든 태그를 한 번에 생성시키기보다, 액션아이템 추출 이후 별도 분석 단계에서 이슈 키워드를 생성하도록 구성했습니다.
+- STT 의존성은 실제 import 테스트 후 `numpy<2`, `torch==2.3.1`, `torchaudio==2.3.1`로 고정했습니다.
+- 대시보드의 `품질 점검` 탭에서 `검토 필요` 항목이 왜 발생했는지 사용자가 이해하기 어렵다고 판단하여, `주요 위험 신호`, `검토 필요 사유 요약`, `검토 필요 항목`을 추가했습니다.
+- `위험 신호 종류 1`처럼 의미가 불명확한 표시를 `주요 위험 신호: 기한 없음`처럼 실제 운영자가 바로 이해할 수 있는 문구로 수정했습니다.
+- `회의에서 언급된 후속 작업을 진행한다`처럼 추상적으로 생성된 액션 설명을, 근거 발화를 바탕으로 `픽셀 보장 내용을 다시 전달한다`, `변경된 카피로 헤드라인 A/B 테스트를 다시 세팅한다`처럼 구체적인 후속 작업으로 보이도록 개선했습니다.
+- `액션 운영` 탭과 `품질 점검` 탭이 같은 DB의 액션아이템과 근거 발화를 기준으로 연결되도록 확인하고, 표시용 작업 설명이 두 탭에서 일관되게 보이도록 수정했습니다.
+- SQLite와 PostgreSQL에서 문자열 집계 함수 문법이 달라 발생할 수 있는 오류를 확인하고, DB 백엔드별 SQL 문법을 분기하도록 수정했습니다.
+- AI가 제안한 코드 변경 후에는 `py_compile`과 Streamlit 실행 화면을 통해 실제 동작 여부를 확인했습니다.
+
+## 거절하거나 변경한 AI 결과물
+
+- 순수 DuckDB 설계는 거절했습니다. 본 프로젝트에서는 분석성 조회보다 액션아이템 상태 변경, 이력 저장, 운영 대시보드 연동이 더 중요했기 때문입니다.
+- raw/canonical description을 직접 사용하는 `dedup_key`는 정규화된 작업 서명 기반으로 변경했습니다.
+- 낮은 신뢰도 항목을 재시도하는 방식은 검토 플래그 방식으로 변경했습니다. 회의 내용이 애매한 경우 재시도를 통해 환각된 확신을 만들기보다, `review_required`로 저장하는 편이 더 적절하다고 판단했습니다.
+
+## AI 활용에 대한 최종 판단
+
+AI 도구는 프로젝트의 개발 속도를 높이고 다양한 구현 대안을 빠르게 검토하는 데 유용했습니다.
+
+하지만 최종 설계 선택, 실험 기준 설정, 결과 해석, 화면 개선 방향, 과제 요구사항 충족 여부 판단은 직접 수행했습니다.
+
+따라서 본 프로젝트에서 AI는 자동 완성 도구라기보다, 기술 검토와 구현을 보조하는 협업 도구로 활용되었습니다.

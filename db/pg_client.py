@@ -185,6 +185,25 @@ CREATE TABLE IF NOT EXISTS slack_payloads (
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS action_item_embeddings (
+    action_item_id VARCHAR PRIMARY KEY,
+    model_name     VARCHAR NOT NULL,
+    vector         BYTEA NOT NULL,
+    text_input     VARCHAR NOT NULL,
+    created_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS meeting_summaries (
+    summary_id     VARCHAR PRIMARY KEY,
+    meeting_id     VARCHAR NOT NULL UNIQUE,
+    agenda_json    VARCHAR NOT NULL DEFAULT '[]',
+    decisions_json VARCHAR NOT NULL DEFAULT '[]',
+    summary_text   VARCHAR NOT NULL DEFAULT '',
+    provider       VARCHAR NOT NULL DEFAULT 'mock',
+    model_name     VARCHAR,
+    created_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE INDEX IF NOT EXISTS idx_stt_runs_meeting_id ON stt_runs(meeting_id);
 CREATE INDEX IF NOT EXISTS idx_participants_meeting_id ON participants(meeting_id);
 CREATE INDEX IF NOT EXISTS idx_utterances_meeting_sequence ON utterances(meeting_id, sequence_no);
@@ -197,6 +216,7 @@ CREATE INDEX IF NOT EXISTS idx_action_item_sources_utterance ON action_item_sour
 CREATE INDEX IF NOT EXISTS idx_issue_keywords_meeting_score ON issue_keywords(meeting_id, score DESC);
 CREATE INDEX IF NOT EXISTS idx_action_item_events_action ON action_item_events(action_item_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_slack_payloads_action ON slack_payloads(action_item_id);
+CREATE INDEX IF NOT EXISTS idx_embeddings_model ON action_item_embeddings(model_name);
 """
 
 DEFAULT_DSN = "postgresql://postgres:postgres@localhost:5432/mobidays_bench"
